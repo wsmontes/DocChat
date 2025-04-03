@@ -43,19 +43,34 @@ class TensorflowMemoryManager {
         try {
             console.log('Cleaning up TensorFlow.js memory...');
             
+            // Safely check if tf is accessible
+            if (!tf || !tf.engine) {
+                console.warn('TensorFlow.js not properly initialized, skipping memory cleanup');
+                return;
+            }
+            
             // Safely dispose variables
             try {
-                tf.disposeVariables();
+                if (typeof tf.disposeVariables === 'function') {
+                    tf.disposeVariables();
+                }
             } catch (error) {
                 console.warn('Error disposing variables:', error);
             }
             
             // Safely end scope
             try {
-                // Get the current engine - this might return undefined if there's an issue
                 const engine = tf.engine();
-                if (engine && typeof engine.endScope === 'function') {
-                    engine.endScope();
+                // Check if engine exists and has a properly initialized scope system
+                if (!engine) {
+                    console.warn('TensorFlow engine is null, cannot end scope.');
+                } else if (typeof engine.endScope === 'function') {
+                    // Additional check to ensure track functionality is available
+                    if (engine.state && typeof engine.state.track === 'function') {
+                        engine.endScope();
+                    } else {
+                        console.warn('TensorFlow scope tracking is not available, skipping endScope');
+                    }
                 }
             } catch (error) {
                 console.warn('Error ending TensorFlow scope:', error);
@@ -63,10 +78,16 @@ class TensorflowMemoryManager {
             
             // Safely start a new scope
             try {
-                // Get the current engine - this might return undefined if there's an issue
                 const engine = tf.engine();
-                if (engine && typeof engine.startScope === 'function') {
-                    engine.startScope();
+                if (!engine) {
+                    console.warn('TensorFlow engine is null, cannot start scope.');
+                } else if (typeof engine.startScope === 'function') {
+                    // Additional check for track functionality
+                    if (engine.state && typeof engine.state.track === 'function') {
+                        engine.startScope();
+                    } else {
+                        console.warn('TensorFlow scope tracking is not available, skipping startScope');
+                    }
                 }
             } catch (error) {
                 console.warn('Error starting TensorFlow scope:', error);

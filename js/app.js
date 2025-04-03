@@ -182,6 +182,24 @@ document.addEventListener('DOMContentLoaded', function() {
     async function processFile(file) {
         if (isProcessingFile) return;
         
+        // Check if file is too large (add a warning for extremely large files)
+        const MAX_FILE_SIZE_WARNING = 50 * 1024 * 1024; // 50MB
+        const MAX_FILE_SIZE_LIMIT = 100 * 1024 * 1024; // 100MB
+        
+        if (file.size > MAX_FILE_SIZE_LIMIT) {
+            alert(`File is too large (${(file.size/1024/1024).toFixed(2)} MB). Maximum file size is ${MAX_FILE_SIZE_LIMIT/1024/1024} MB.`);
+            return;
+        }
+        
+        if (file.size > MAX_FILE_SIZE_WARNING) {
+            const confirm = window.confirm(
+                `This file is very large (${(file.size/1024/1024).toFixed(2)} MB) and may take a while to process. ` +
+                `For best performance, consider splitting it into smaller files. ` +
+                `\n\nDo you want to continue?`
+            );
+            if (!confirm) return;
+        }
+        
         // Check if file type is supported
         if (!documentProcessor.isFileSupported(file)) {
             alert('Unsupported file type. Please upload a text, Markdown, HTML, PDF, or CSV file.');
@@ -191,11 +209,51 @@ document.addEventListener('DOMContentLoaded', function() {
         isProcessingFile = true;
         showProcessingSection();
         
+        // Ensure UI is updated before starting intensive processing
+        await new Promise(resolve => setTimeout(resolve, 50));
+        
         try {
             // Step 1: Extract text from file
             console.log(`Processing file: ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)`);
             updateProcessingStatus(0.1, 'Extracting text from document...');
-            const text = await documentProcessor.extractTextFromFile(file, updateProcessingStatus);
+            
+            // Set timeout for very large files to prevent browser from showing "page unresponsive" dialog
+            let extractionTimeout;
+            if (file.size > 20 * 1024 * 1024) { // For files > 20MB
+                const extractionPrompt = document.createElement('div');
+                extractionPrompt.className = 'extraction-prompt';
+                extractionPrompt.innerHTML = `
+                    <div class="alert alert-info" style="position: fixed; bottom: 20px; right: 20px; max-width: 400px; z-index: 9999;">
+                        <p><b>Processing large file...</b></p>
+                        <p>This may take a while depending on your device's capabilities.</p>
+                        <div class="progress mb-2">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated" style="width: 100%"></div>
+                        </div>
+                        <p class="small text-muted">The browser may appear unresponsive during processing.</p>
+                    </div>
+                `;
+                document.body.appendChild(extractionPrompt);
+                
+                extractionTimeout = setTimeout(() => {
+                    // Update the prompt after 10 seconds for very large files
+                    extractionPrompt.querySelector('p:first-child').innerHTML = 
+                        `<b>Still working...</b> Processing a ${(file.size/1024/1024).toFixed(1)}MB file`;
+                }, 10000);
+            }
+            
+            // Extract text with improved progress reporting
+            const text = await documentProcessor.extractTextFromFile(file, (progress, message) => {
+                updateProcessingStatus(progress, message);
+                // Ensure UI is updated by forcing a reflow
+                void document.body.offsetHeight;
+            });
+            
+            // Clean up extraction prompt if it exists
+            if (extractionTimeout) {
+                clearTimeout(extractionTimeout);
+                const prompt = document.querySelector('.extraction-prompt');
+                if (prompt) prompt.remove();
+            }
             
             if (!text || text.trim().length === 0) {
                 throw new Error('No text content found in the document.');
@@ -211,22 +269,72 @@ document.addEventListener('DOMContentLoaded', function() {
             updateProcessingStatus(0.5, 'Analyzing document...');
             const metadata = documentProcessor.extractMetadata(text, file);
             
-            // Step 3: Chunk the document
+            // Step 3: Chunk the document with intermediate UI updates
             updateProcessingStatus(0.6, 'Chunking document...');
-            const chunks = documentProcessor.chunkDocument(text, updateProcessingStatus);
             
-            // Step 4: Vectorize chunks
-            updateProcessingStatus(0.7, 'Generating embeddings...');
+            // For large texts, split the chunking process to allow UI updates
+            let chunks;
+            if (text.length > 1000000) { // For texts > 1MB
+                updateProcessingStatus(0.6, 'Breaking down large document...');
+                // Yield to the UI thread before starting chunking
+                await new Promise(resolve => setTimeout(resolve, 50));
+                chunks = await documentProcessor.chunkDocument(text, (progress, message) => {
+                    // Map the chunking progress (0.6-0.7) to overall progress
+                    const overallProgress = 0.6 + (progress - 0.4) * 0.1;
+                    updateProcessingStatus(overallProgress, message);
+                });
+            } else {
+                chunks = await documentProcessor.chunkDocument(text, updateProcessingStatus);
+            }
+            
+            // Step 4: Vectorize chunks with better progress indication
+            updateProcessingStatus(0.7, 'Preparing to generate embeddings...');
+            
+            // Yield to UI thread before starting vectorization
+            await new Promise(resolve => setTimeout(resolve, 50));
+            
             const chunkTexts = chunks.map(chunk => chunk.text);
             
             // Ensure the vectorizer model is loaded
+            updateProcessingStatus(0.71, 'Loading vectorization model...');
             await vectorizer.loadModel();
             
-            // Generate embeddings
-            const embeddings = await vectorizer.vectorizeBatch(chunkTexts, (progress) => {
-                const overallProgress = 0.7 + (progress * 0.25);
-                updateProcessingStatus(overallProgress, 'Generating embeddings...');
-            });
+            // Generate embeddings with chunked processing for large datasets
+            updateProcessingStatus(0.75, 'Generating embeddings...');
+            
+            let embeddings;
+            const CHUNKS_PER_BATCH = 20; // Process 20 chunks at a time to prevent freezing
+            
+            if (chunkTexts.length > CHUNKS_PER_BATCH) {
+                // For many chunks, process in batches to keep UI responsive
+                embeddings = [];
+                const totalBatches = Math.ceil(chunkTexts.length / CHUNKS_PER_BATCH);
+                
+                for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+                    // Yield to UI between batches
+                    if (batchIndex > 0) {
+                        await new Promise(resolve => setTimeout(resolve, 30));
+                    }
+                    
+                    const start = batchIndex * CHUNKS_PER_BATCH;
+                    const end = Math.min(start + CHUNKS_PER_BATCH, chunkTexts.length);
+                    const batchTexts = chunkTexts.slice(start, end);
+                    
+                    updateProcessingStatus(
+                        0.75 + 0.2 * (batchIndex / totalBatches),
+                        `Generating embeddings (batch ${batchIndex + 1}/${totalBatches})...`
+                    );
+                    
+                    const batchEmbeddings = await vectorizer.vectorizeBatch(batchTexts);
+                    embeddings.push(...batchEmbeddings);
+                }
+            } else {
+                // For fewer chunks, process all at once
+                embeddings = await vectorizer.vectorizeBatch(chunkTexts, (progress) => {
+                    const overallProgress = 0.75 + (progress * 0.2);
+                    updateProcessingStatus(overallProgress, 'Generating embeddings...');
+                });
+            }
             
             // Step 5: Prepare vectorized chunks
             updateProcessingStatus(0.95, 'Finalizing document processing...');
@@ -265,6 +373,15 @@ document.addEventListener('DOMContentLoaded', function() {
             showUploadSection();
         } finally {
             isProcessingFile = false;
+            
+            // Perform garbage collection after processing large files
+            if (window.gc) {
+                try {
+                    window.gc();
+                } catch (e) {
+                    console.log('Manual garbage collection not supported');
+                }
+            }
         }
     }
     
@@ -826,6 +943,23 @@ document.addEventListener('DOMContentLoaded', function() {
         
         // Add a system message that the chat was cleared
         addSystemMessage('Chat history cleared. You can ask new questions about the document.');
+    }
+
+    // Update the handleFiles function to identify Excel files
+    function handleFiles(files) {
+        if (files.length === 0) return;
+        
+        const file = files[0];
+        const fileType = file.name.split('.').pop().toLowerCase();
+        
+        // Show CSV analyzer for CSV and Excel files
+        if (fileType === 'csv' || fileType === 'xlsx' || fileType === 'xls') {
+            // Initialize and open CSV analyzer
+            processDocument(file);
+        } else {
+            // Regular document processing
+            processDocument(file);
+        }
     }
 
     // Initialize app (only once)

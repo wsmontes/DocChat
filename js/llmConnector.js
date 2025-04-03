@@ -107,15 +107,17 @@ class LlmConnector {
     /**
      * Send a request to the LLM API
      * @param {Array<Object>} messages - Chat messages
+     * @param {AbortSignal} [signal] - Optional signal to abort the request
      * @returns {Promise<string>} Response text
      */
-    async sendRequest(messages) {
+    async sendRequest(messages, signal = undefined) {
         const response = await fetch(this.baseUrl, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${this.apiKey}`
             },
+            signal,  // <-- new addition to allow aborting
             body: JSON.stringify({
                 model: this.model,
                 messages: messages,
