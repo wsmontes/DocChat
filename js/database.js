@@ -287,6 +287,38 @@ class DocumentDatabase {
     }
     
     /**
+     * Get all chunks for a document by document ID
+     * @param {number} documentId - Document ID
+     * @returns {Promise<Array<Object>>} All chunks for the document
+     */
+    async getAllChunks(documentId) {
+        await this.waitForReady();
+        
+        return new Promise((resolve, reject) => {
+            const transaction = this.db.transaction(['chunks'], 'readonly');
+            const chunkStore = transaction.objectStore('chunks');
+            const chunks = [];
+            
+            const index = chunkStore.index('documentId');
+            index.openCursor(IDBKeyRange.only(documentId)).onsuccess = (event) => {
+                const cursor = event.target.result;
+                if (cursor) {
+                    chunks.push(cursor.value);
+                    cursor.continue();
+                }
+            };
+            
+            transaction.oncomplete = () => {
+                resolve(chunks);
+            };
+            
+            transaction.onerror = (event) => {
+                reject(event.target.error);
+            };
+        });
+    }
+    
+    /**
      * Get a document by ID
      * @param {number} id - Document ID
      * @returns {Promise<Object>} Document metadata

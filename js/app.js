@@ -844,20 +844,48 @@ document.addEventListener('DOMContentLoaded', function() {
             // Step 1: Convert question to embedding
             const questionEmbedding = await vectorizer.vectorize(question);
             
-            // Step 2: Find relevant chunks
-            const relevantChunks = await docDB.findSimilarChunks(questionEmbedding, 5, currentDocument.id);
+            // Step 2: Find relevant chunks using two methods
+            
+            // Method A: Traditional embedding similarity search
+            const embeddingChunks = await docDB.findSimilarChunks(questionEmbedding, 5, currentDocument.id);
+            
+            // Method B: Term-based search
+            const allDocumentChunks = await docDB.getAllChunks(currentDocument.id);
+            const termBasedChunks = termSearch.search(question, allDocumentChunks, 5);
+            
+            // Step 3: Merge results for better coverage
+            const mergedChunks = mergeSearchResults(embeddingChunks, termBasedChunks);
             
             // Store in window object for citation reference
-            window.lastRelevantChunks = relevantChunks;
+            window.lastRelevantChunks = mergedChunks;
+            window.embeddingChunks = embeddingChunks; // Store for debugging
+            window.termBasedChunks = termBasedChunks; // Store for debugging
             
             // If no chunks were found, show an error
-            if (relevantChunks.length === 0) {
+            if (mergedChunks.length === 0) {
                 removeMessage(typingMsgId);
                 addAssistantMessage("I couldn't find any relevant information in the document to answer your question.");
                 return;
             }
             
-            // Step 3: Generate answer using LLM with streaming
+            // Log the search results for analysis
+            console.log('Embedding search results:', embeddingChunks.map(c => ({
+                similarity: c.similarity.toFixed(3),
+                text: c.text.substring(0, 100) + '...'
+            })));
+            
+            console.log('Term-based search results:', termBasedChunks.map(c => ({
+                termScore: c.termScore.toFixed(3),
+                terms: c.terms,
+                text: c.text.substring(0, 100) + '...'
+            })));
+            
+            console.log('Merged results:', mergedChunks.map(c => ({
+                score: c.mergedScore ? c.mergedScore.toFixed(3) : 'N/A',
+                text: c.text.substring(0, 100) + '...'
+            })));
+            
+            // Step 4: Generate answer using LLM with streaming
             let currentResponseText = '';
             const messageElement = document.createElement('div');
             messageElement.className = 'chat-message assistant';
@@ -880,7 +908,7 @@ document.addEventListener('DOMContentLoaded', function() {
             });
             
             // Use streaming to update the message as the response comes in
-            await llmConnector.getAnswer(question, relevantChunks, (delta, fullText) => {
+            await llmConnector.getAnswer(question, mergedChunks, (delta, fullText) => {
                 currentResponseText = fullText;
                 const paragraphElement = messageElement.querySelector('p');
                 paragraphElement.innerHTML = formatMessageText(fullText);
@@ -931,6 +959,78 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
+    /**
+     * Merge and rerank search results from multiple methods
+     * @param {Array<Object>} embeddingResults - Results from embedding similarity search
+     * @param {Array<Object>} termResults - Results from term-based search
+     * @returns {Array<Object>} Merged and reranked results
+     */
+    function mergeSearchResults(embeddingResults, termResults) {
+        // Create a map to track chunks by ID to avoid duplicates
+        const chunkMap = new Map();
+        
+        // Process embedding results
+        embeddingResults.forEach((chunk, index) => {
+            chunkMap.set(chunk.id, {
+                ...chunk,
+                embeddingRank: index + 1,
+                embeddingScore: chunk.similarity
+            });
+        });
+        
+        // Process term-based results
+        termResults.forEach((chunk, index) => {
+            if (chunkMap.has(chunk.id)) {
+                // Update existing chunk with term-based scores
+                const existingChunk = chunkMap.get(chunk.id);
+                chunkMap.set(chunk.id, {
+                    ...existingChunk,
+                    termRank: index + 1,
+                    termScore: chunk.termScore,
+                    terms: chunk.terms
+                });
+            } else {
+                // Add new chunk from term-based search
+                chunkMap.set(chunk.id, {
+                    ...chunk,
+                    termRank: index + 1,
+                    termScore: chunk.termScore,
+                    similarity: 0
+                });
+            }
+        });
+        
+        // Calculate a combined score for each chunk
+        const combinedResults = Array.from(chunkMap.values()).map(chunk => {
+            // Default values if a method didn't find this chunk
+            const embeddingRank = chunk.embeddingRank || (embeddingResults.length + 1);
+            const termRank = chunk.termRank || (termResults.length + 1);
+            const embeddingScore = chunk.embeddingScore || 0;
+            const termScore = chunk.termScore || 0;
+            
+            // Combined score (weighted sum of normalized scores)
+            const normalizedEmbeddingScore = embeddingScore;
+            const normalizedTermScore = termScore / 3; // Scale term scores
+            
+            // Merged score - 60% embedding, 40% term-based
+            const mergedScore = (normalizedEmbeddingScore * 0.6) + (normalizedTermScore * 0.4);
+            
+            // Rank boost if found by both methods
+            const rankBoost = chunk.embeddingRank && chunk.termRank ? 0.1 : 0;
+            
+            return {
+                ...chunk,
+                mergedScore: mergedScore + rankBoost
+            };
+        });
+        
+        // Sort by merged score (descending)
+        combinedResults.sort((a, b) => b.mergedScore - a.mergedScore);
+        
+        // Return top chunks (max of 5)
+        return combinedResults.slice(0, 5);
+    }
+
     // Function to clear the chat history
     function clearChat() {
         // Keep only the first system welcome message
