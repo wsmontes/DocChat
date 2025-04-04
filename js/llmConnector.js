@@ -51,17 +51,29 @@ class LlmConnector {
         
         // Prepare context from chunks
         const context = relevantChunks.map((chunk, index) => {
-            return `[${index + 1}] ${chunk.text}`;
+            // Include document title if available
+            const docInfo = chunk.documentTitle ? ` (from "${chunk.documentTitle}")` : '';
+            return `[${index + 1}]${docInfo} ${chunk.text}`;
         }).join('\n\n');
         
         // Check if this is CSV data by looking for the CSV TABLE ANALYSIS header
         const isCSVData = context.includes('# CSV TABLE ANALYSIS');
         
-        // Create system prompt with special handling for CSV data
+        // Check if we're using multiple documents
+        const documentIds = [...new Set(relevantChunks.map(chunk => chunk.documentId))];
+        const isMultiDocument = documentIds.length > 1;
+        
+        // Create system prompt with special handling for CSV data and multiple documents
         let systemPrompt = `You are a helpful assistant that answers questions based on the provided document excerpts. 
         Only use the information from the excerpts to answer. If the answer cannot be found in the excerpts, 
         say "I don't have enough information in the document to answer that question." 
         When citing information, refer to the excerpt numbers like this: [1], [2], etc.`;
+        
+        if (isMultiDocument) {
+            systemPrompt += `\n\nYou have access to multiple documents. When citing information, reference the document
+            source that's indicated with each excerpt. Organize your answer to clearly distinguish information from
+            different documents when appropriate, especially if they contain different or contradictory information.`;
+        }
         
         if (isCSVData) {
             systemPrompt += `\n\nThe document contains CSV (tabular) data. 
@@ -94,7 +106,7 @@ class LlmConnector {
         // Add current context and question
         messages.push({
             role: 'user',
-            content: `Here are excerpts from a document:\n\n${context}\n\nBased only on these excerpts, answer the following question: ${question}`
+            content: `Here are excerpts from ${isMultiDocument ? 'multiple documents' : 'a document'}:\n\n${context}\n\nBased only on these excerpts, answer the following question: ${question}`
         });
         
         if (streamHandler) {
@@ -195,6 +207,176 @@ class LlmConnector {
         }
         
         return fullText.trim();
+    }
+
+    /**
+     * Generate summaries for chunk groups 
+     * @param {Array<Array<Object>>} chunkGroups - Groups of chunks to summarize
+     * @param {string} question - The original user question for context
+     * @param {Array<Object>} [conversationHistory=[]] - Previous conversation messages
+     * @returns {Promise<Array<{summary: string, chunks: Array<Object>}>>} Summaries with their source chunks
+     */
+    async generateChunkGroupSummaries(chunkGroups, question, conversationHistory = []) {
+        if (!this.isConfigured) {
+            throw new Error('API key not configured');
+        }
+        
+        const summaries = [];
+        
+        // Process each chunk group in parallel with rate limiting
+        const concurrencyLimit = 3; // Maximum concurrent requests
+        const batchResults = [];
+        
+        // Create batches to process
+        for (let i = 0; i < chunkGroups.length; i += concurrencyLimit) {
+            const batch = chunkGroups.slice(i, i + concurrencyLimit);
+            const batchPromises = batch.map(async (group, index) => {
+                try {
+                    // Format the chunks into a readable context
+                    const context = group.map((chunk, idx) => {
+                        const docInfo = chunk.documentTitle ? ` (from "${chunk.documentTitle}")` : '';
+                        return `[${idx + 1}]${docInfo} ${chunk.text}`;
+                    }).join('\n\n');
+                    
+                    // Create system prompt with context from conversation history
+                    let conversationContext = '';
+                    if (conversationHistory && conversationHistory.length > 0) {
+                        // Extract last few exchanges for context
+                        const recentHistory = conversationHistory.slice(-4);
+                        conversationContext = recentHistory.map(msg => 
+                            `${msg.role === 'user' ? 'User asked' : 'You answered'}: ${msg.content.substring(0, 200)}...`
+                        ).join('\n');
+                    }
+                    
+                    // Create messages for the API
+                    const messages = [
+                        {
+                            role: 'system',
+                            content: `You are an AI that creates concise summaries of document excerpts. 
+                            Summarize the key information in the provided excerpts that would be most relevant to answering the user's question.
+                            Focus only on the most relevant facts and details.
+                            Keep your summary under 150 words.`
+                        },
+                        {
+                            role: 'user',
+                            content: `
+                            I need a concise summary of these document excerpts that focuses on information relevant to the following question: "${question}"
+                            
+                            ${conversationContext ? `\nRecent conversation context:\n${conversationContext}\n` : ''}
+                            
+                            Document excerpts:
+                            ${context}
+                            
+                            Create a concise summary of the most relevant information from these excerpts that would help answer the question.
+                            `
+                        }
+                    ];
+                    
+                    // Make API request with a timeout to prevent stalling
+                    const summary = await this.sendRequest(messages);
+                    
+                    return {
+                        summary,
+                        chunks: group,
+                        originalIndex: i + index
+                    };
+                } catch (error) {
+                    console.error(`Error generating summary for chunk group ${i + index}:`, error);
+                    // Return a fallback summary to ensure we don't lose the chunks
+                    return {
+                        summary: "Error generating summary.",
+                        chunks: group,
+                        originalIndex: i + index,
+                        error: true
+                    };
+                }
+            });
+            
+            // Wait for the current batch to complete
+            const batchResults = await Promise.all(batchPromises);
+            summaries.push(...batchResults);
+            
+            // Small delay between batches to avoid rate limiting
+            if (i + concurrencyLimit < chunkGroups.length) {
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+        }
+        
+        // Sort by original index to maintain order
+        summaries.sort((a, b) => a.originalIndex - b.originalIndex);
+        
+        return summaries;
+    }
+    
+    /**
+     * Find related terms to expand a search query
+     * @param {string} question - User's question that yielded no results
+     * @param {Array<string>} originalTerms - The original search terms
+     * @param {Array<Object>} [conversationHistory=[]] - Previous conversation messages
+     * @returns {Promise<Array<string>>} List of related terms to try
+     */
+    async findRelatedTerms(question, originalTerms, conversationHistory = []) {
+        if (!this.isConfigured) {
+            throw new Error('API key not configured');
+        }
+        
+        // Create conversation context
+        let conversationContext = '';
+        if (conversationHistory && conversationHistory.length > 0) {
+            // Extract last few exchanges for context
+            const recentHistory = conversationHistory.slice(-4);
+            conversationContext = recentHistory.map(msg => 
+                `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content.substring(0, 200)}...`
+            ).join('\n');
+        }
+        
+        const messages = [
+            {
+                role: 'system',
+                content: `You are an AI that helps expand search queries when initial searches yield no results.
+                For a given question and its extracted search terms, you should generate alternative terms,
+                synonyms, related concepts, and broader category terms that might help find relevant information.
+                Return your response as a JSON array of strings containing only the alternative search terms.`
+            },
+            {
+                role: 'user',
+                content: `
+                I searched for information using these terms but found no results: ${originalTerms.join(', ')}
+                
+                My original question was: "${question}"
+                
+                ${conversationContext ? `\nRecent conversation context:\n${conversationContext}\n` : ''}
+                
+                Please generate alternative search terms, synonyms, related concepts, and broader category terms 
+                that might help find relevant information. Only include terms that are likely to appear in documents.
+                
+                Format your response as a JSON array of strings, for example:
+                ["term1", "term2", "related phrase", "broader concept"]
+                `
+            }
+        ];
+        
+        try {
+            const response = await this.sendRequest(messages);
+            
+            // Parse the response as JSON
+            const relatedTermsMatch = response.match(/\[.*\]/s);
+            if (relatedTermsMatch) {
+                try {
+                    const relatedTerms = JSON.parse(relatedTermsMatch[0]);
+                    return Array.isArray(relatedTerms) ? relatedTerms : [];
+                } catch (parseError) {
+                    console.error('Error parsing related terms JSON:', parseError);
+                    // Fallback: extract terms using regex
+                    const terms = response.match(/"([^"]*)"/g);
+                    return terms ? terms.map(t => t.replace(/"/g, '')) : [];
+                }
+            }
+            return [];
+        } catch (error) {
+            console.error('Error finding related terms:', error);
+            return [];
+        }
     }
 }
 

@@ -335,3 +335,80 @@ code {
 .multi-file-item .remove-file:hover {
     background-color: #f8d7da;
 }
+
+/* Document Selection Panel */
+.document-selection-list {
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid #eee;
+    border-radius: 4px;
+    padding: 0.5rem;
+    background-color: #f8f9fa;
+}
+
+.document-selection-item {
+    display: flex;
+    align-items: flex-start;
+    padding: 0.4rem 0.2rem;
+    border-bottom: 1px solid #f0f0f0;
+    transition: background-color 0.2s;
+}
+
+.document-selection-item:last-child {
+    border-bottom: none;
+}
+
+.document-selection-item:hover {
+    background-color: #f0f4f8;
+}
+
+.document-selection-item .form-check {
+    margin: 0;
+}
+
+.document-selection-item .form-check-input {
+    margin-top: 0.25rem;
+}
+
+.document-selection-item .document-title {
+    font-size: 0.9rem;
+    font-weight: 500;
+    margin: 0 0 0.1rem 0;
+    line-height: 1.2;
+    word-break: break-word;
+}
+
+.document-selection-item .document-info {
+    font-size: 0.75rem;
+    color: #6c757d;
+    display: block;
+}
+
+.document-active-badge {
+    display: inline-block;
+    font-size: 0.65rem;
+    background-color: #198754;
+    color: white;
+    border-radius: 3px;
+    padding: 0.1rem 0.3rem;
+    margin-left: 0.3rem;
+}
+
+/* Multiple document indicator in chat messages */
+.document-indicator {
+    background: rgba(13, 110, 253, 0.1);
+    border-radius: 4px;
+    padding: 0.2rem 0.4rem;
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: #0d6efd;
+}
+
+.document-indicator .document-tag {
+    display: inline-block;
+    background: rgba(13, 110, 253, 0.2);
+    border-radius: 3px;
+    padding: 0.1rem 0.3rem;
+    margin: 0.1rem;
+    font-size: 0.7rem;
+}

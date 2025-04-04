@@ -237,28 +237,38 @@ class DocumentDatabase {
     }
     
     /**
-     * Find similar chunks to a query embedding
+     * Find similar chunks to a query embedding across multiple documents
      * @param {Array<number>} queryEmbedding - Query embedding vector
      * @param {number} limit - Maximum number of results
-     * @param {number} [documentId] - Optional document ID to search within
+     * @param {Array<number>|number|null} documentIds - Optional document ID(s) to search within
      * @returns {Promise<Array<Object>>} Similar chunks
      */
-    async findSimilarChunks(queryEmbedding, limit = 5, documentId = null) {
+    async findSimilarChunks(queryEmbedding, limit = 5, documentIds = null) {
         await this.waitForReady();
         
         return new Promise((resolve, reject) => {
-            const transaction = this.db.transaction(['chunks'], 'readonly');
+            const transaction = this.db.transaction(['chunks', 'documents'], 'readonly');
             const chunkStore = transaction.objectStore('chunks');
+            const docStore = transaction.objectStore('documents');
             const allChunks = [];
+            const documentTitles = {};
             
-            const chunkCursor = documentId 
-                ? chunkStore.index('documentId').openCursor(IDBKeyRange.only(documentId))
-                : chunkStore.openCursor();
+            // Convert documentIds to array if it's a single ID
+            let docIdArray = documentIds;
+            if (documentIds !== null && !Array.isArray(documentIds)) {
+                docIdArray = [documentIds];
+            }
+            
+            // Use the cursor to get all chunks
+            const chunkCursor = chunkStore.openCursor();
                 
             chunkCursor.onsuccess = (event) => {
                 const cursor = event.target.result;
                 if (cursor) {
-                    allChunks.push(cursor.value);
+                    // Only add chunk if it belongs to one of our documents or we're not filtering
+                    if (docIdArray === null || docIdArray.includes(cursor.value.documentId)) {
+                        allChunks.push(cursor.value);
+                    }
                     cursor.continue();
                 } else {
                     if (allChunks.length === 0) {
@@ -266,17 +276,76 @@ class DocumentDatabase {
                         return;
                     }
                     
-                    // Calculate similarity for all chunks
-                    const similarities = allChunks.map(chunk => {
-                        const similarity = vectorizer.cosineSimilarity(queryEmbedding, chunk.embedding);
-                        return { ...chunk, similarity };
+                    // Get document titles for all chunks
+                    const docIds = [...new Set(allChunks.map(chunk => chunk.documentId))];
+                    let loadedCount = 0;
+                    
+                    docIds.forEach(id => {
+                        const docRequest = docStore.get(id);
+                        docRequest.onsuccess = () => {
+                            if (docRequest.result) {
+                                documentTitles[id] = docRequest.result.title || `Document ${id}`;
+                            }
+                            loadedCount++;
+                            
+                            // When all titles are loaded, calculate similarities
+                            if (loadedCount === docIds.length) {
+                                // Calculate similarity for all chunks
+                                const similarities = allChunks.map(chunk => {
+                                    const similarity = vectorizer.cosineSimilarity(queryEmbedding, chunk.embedding);
+                                    return { 
+                                        ...chunk, 
+                                        similarity,
+                                        documentTitle: documentTitles[chunk.documentId] || `Document ${chunk.documentId}`
+                                    };
+                                });
+                                
+                                // Group results by document to ensure balanced representation
+                                const docResults = {};
+                                docIdArray?.forEach(id => {
+                                    docResults[id] = [];
+                                });
+                                
+                                // Sort chunks by document and by similarity
+                                similarities.forEach(chunk => {
+                                    const docId = chunk.documentId;
+                                    if (docIdArray === null || docIdArray.includes(docId)) {
+                                        if (!docResults[docId]) {
+                                            docResults[docId] = [];
+                                        }
+                                        docResults[docId].push(chunk);
+                                    }
+                                });
+                                
+                                // Sort each document's chunks by similarity
+                                Object.values(docResults).forEach(chunks => {
+                                    chunks.sort((a, b) => b.similarity - a.similarity);
+                                });
+                                
+                                // Determine number of results to take from each document
+                                const docsCount = Object.keys(docResults).length;
+                                const perDocLimit = Math.max(1, Math.ceil(limit / docsCount));
+                                
+                                // Take top results from each document
+                                const balancedResults = [];
+                                Object.values(docResults).forEach(chunks => {
+                                    balancedResults.push(...chunks.slice(0, perDocLimit));
+                                });
+                                
+                                // Sort all results by similarity and take top ones
+                                balancedResults.sort((a, b) => b.similarity - a.similarity);
+                                
+                                // Return top results, with a slight preference for balance
+                                resolve(balancedResults.slice(0, limit));
+                            }
+                        };
+                        
+                        docRequest.onerror = (event) => {
+                            console.error('Error loading document title:', event);
+                            loadedCount++;
+                            // Continue with other titles if one fails
+                        };
                     });
-                    
-                    // Sort by similarity (descending)
-                    similarities.sort((a, b) => b.similarity - a.similarity);
-                    
-                    // Return top results
-                    resolve(similarities.slice(0, limit));
                 }
             };
             

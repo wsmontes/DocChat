@@ -32,15 +32,24 @@ document.addEventListener('DOMContentLoaded', function() {
     const importEmbeddingsModal = new bootstrap.Modal(document.getElementById('importEmbeddingsModal'));
     const embeddingsFileInput = document.getElementById('embeddingsFileInput');
     const confirmImportBtn = document.getElementById('confirmImportBtn');
+    const selectAllDocs = document.getElementById('selectAllDocs');
+    const selectNoneDocs = document.getElementById('selectNoneDocs');
+    const documentSelectionList = document.getElementById('documentSelectionList');
     
     // App state
     let isProcessingFile = false;
     let currentDocument = null;
     let initialized = false;
     let messageIdCounter = 0;
-    // Add conversation history tracker
     let conversationHistory = [];
-    
+    // New variables for document selection
+    let selectedDocuments = [];
+    let availableDocuments = [];
+    // Add persistence for query context
+    let lastQueryEmbedding = null;
+    let lastRelevantDocuments = [];
+    let lastQueryTerms = [];
+
     // Setup event listeners
     function setupEventListeners() {
         // File drag & drop
@@ -175,6 +184,19 @@ document.addEventListener('DOMContentLoaded', function() {
         const clearChatBtn = document.getElementById('clearChatBtn');
         if (clearChatBtn) {
             clearChatBtn.addEventListener('click', clearChat);
+        }
+        
+        // Add new document selection event listeners
+        if (selectAllDocs) {
+            selectAllDocs.addEventListener('click', () => {
+                selectAllDocuments();
+            });
+        }
+        
+        if (selectNoneDocs) {
+            selectNoneDocs.addEventListener('click', () => {
+                deselectAllDocuments();
+            });
         }
     }
     
@@ -415,6 +437,9 @@ document.addEventListener('DOMContentLoaded', function() {
         processingSection.classList.add('d-none');
         chatSection.classList.remove('d-none');
         librarySection.classList.add('d-none');
+        
+        // Load available documents for selection panel
+        loadDocumentSelectionPanel();
     }
     
     // Show the library section
@@ -531,6 +556,11 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // Set as current document
             currentDocument = document;
+            
+            // Add to selected documents list if not already there
+            if (!selectedDocuments.includes(document.id)) {
+                selectedDocuments.push(document.id);
+            }
             
             // Show chat interface
             showChatSection();
@@ -823,7 +853,13 @@ document.addEventListener('DOMContentLoaded', function() {
     // Send a question to the LLM
     async function sendQuestion() {
         const question = userQuestion.value.trim();
-        if (!question || !currentDocument) return;
+        if (!question) return;
+        
+        // Check if any documents are selected
+        if (selectedDocuments.length === 0) {
+            addErrorMessage('Please select at least one document to ask questions about.');
+            return;
+        }
         
         // Add user message to chat
         addUserMessage(question);
@@ -841,51 +877,52 @@ document.addEventListener('DOMContentLoaded', function() {
                 return;
             }
             
-            // Step 1: Convert question to embedding
-            const questionEmbedding = await vectorizer.vectorize(question);
+            // Extract terms for possible fallback search
+            const originalTerms = termSearch.extractTerms(question);
+            // Store for context persistence
+            lastQueryTerms = originalTerms;
             
-            // Step 2: Find relevant chunks using two methods
+            // Call the search function with fallback handling and context awareness
+            const searchResults = await performSearchWithFallbacks(
+                question, 
+                selectedDocuments, 
+                conversationHistory,
+                originalTerms
+            );
             
-            // Method A: Traditional embedding similarity search
-            const embeddingChunks = await docDB.findSimilarChunks(questionEmbedding, 5, currentDocument.id);
-            
-            // Method B: Term-based search
-            const allDocumentChunks = await docDB.getAllChunks(currentDocument.id);
-            const termBasedChunks = termSearch.search(question, allDocumentChunks, 5);
-            
-            // Step 3: Merge results for better coverage
-            const mergedChunks = mergeSearchResults(embeddingChunks, termBasedChunks);
-            
-            // Store in window object for citation reference
-            window.lastRelevantChunks = mergedChunks;
-            window.embeddingChunks = embeddingChunks; // Store for debugging
-            window.termBasedChunks = termBasedChunks; // Store for debugging
-            
-            // If no chunks were found, show an error
-            if (mergedChunks.length === 0) {
+            if (!searchResults || searchResults.chunks.length === 0) {
                 removeMessage(typingMsgId);
-                addAssistantMessage("I couldn't find any relevant information in the document to answer your question.");
+                addAssistantMessage("I couldn't find any relevant information in the selected documents to answer your question.");
                 return;
             }
             
-            // Log the search results for analysis
-            console.log('Embedding search results:', embeddingChunks.map(c => ({
-                similarity: c.similarity.toFixed(3),
-                text: c.text.substring(0, 100) + '...'
-            })));
+            // Update document relevance tracking
+            updateLastRelevantDocuments(searchResults.chunks);
             
-            console.log('Term-based search results:', termBasedChunks.map(c => ({
-                termScore: c.termScore.toFixed(3),
-                terms: c.terms,
-                text: c.text.substring(0, 100) + '...'
-            })));
+            // If we have results from fallback search, inform the user
+            if (searchResults.usedFallback) {
+                removeMessage(typingMsgId);
+                const fallbackMessage = document.createElement('div');
+                fallbackMessage.className = 'chat-message system';
+                fallbackMessage.innerHTML = `
+                    <div class="chat-bubble">
+                        <p>I couldn't find exact matches for your question, but I found some potentially related information.</p>
+                    </div>
+                `;
+                chatMessages.appendChild(fallbackMessage);
+                scrollChatToBottom();
+                
+                // Add a new typing indicator
+                typingMsgId = addTypingIndicator();
+            }
             
-            console.log('Merged results:', mergedChunks.map(c => ({
-                score: c.mergedScore ? c.mergedScore.toFixed(3) : 'N/A',
-                text: c.text.substring(0, 100) + '...'
-            })));
+            // Store in window object for citation reference
+            window.lastRelevantChunks = searchResults.chunks;
             
-            // Step 4: Generate answer using LLM with streaming
+            // Get document sources for the chunks
+            const docSources = [...new Set(searchResults.chunks.map(c => c.documentId))];
+            
+            // Generate answer using LLM with streaming
             let currentResponseText = '';
             const messageElement = document.createElement('div');
             messageElement.className = 'chat-message assistant';
@@ -894,12 +931,17 @@ document.addEventListener('DOMContentLoaded', function() {
             messageElement.innerHTML = `
                 <div class="chat-bubble">
                     <p></p>
+                    ${docSources.length > 1 ? 
+                        `<div class="document-indicator">
+                            Using information from ${docSources.length} documents
+                        </div>` : ''}
                 </div>
             `;
             
             // Replace typing indicator with actual message element
             removeMessage(typingMsgId);
             chatMessages.appendChild(messageElement);
+            scrollChatToBottom();
             
             // Add question to conversation history
             conversationHistory.push({
@@ -908,12 +950,28 @@ document.addEventListener('DOMContentLoaded', function() {
             });
             
             // Use streaming to update the message as the response comes in
-            await llmConnector.getAnswer(question, mergedChunks, (delta, fullText) => {
+            await llmConnector.getAnswer(question, searchResults.chunks, (delta, fullText) => {
                 currentResponseText = fullText;
                 const paragraphElement = messageElement.querySelector('p');
                 paragraphElement.innerHTML = formatMessageText(fullText);
-                chatMessages.scrollTop = chatMessages.scrollHeight;
+                scrollChatToBottom();
             }, conversationHistory);
+            
+            // Add document sources if using multiple documents
+            if (docSources.length > 1) {
+                const documentNames = await Promise.all(docSources.map(async docId => {
+                    const doc = await docDB.getDocument(docId);
+                    return doc ? doc.title : `Document ${docId}`;
+                }));
+                
+                const documentIndicator = messageElement.querySelector('.document-indicator');
+                if (documentIndicator) {
+                    documentIndicator.innerHTML = `
+                        Sources: ${documentNames.map(name => 
+                            `<span class="document-tag">${name}</span>`).join(' ')}
+                    `;
+                }
+            }
             
             // Add response to conversation history
             conversationHistory.push({
@@ -921,35 +979,18 @@ document.addEventListener('DOMContentLoaded', function() {
                 content: currentResponseText
             });
             
-            // Limit conversation history to last 10 exchanges (5 user questions and 5 assistant responses)
+            // Limit conversation history to last 10 exchanges
             if (conversationHistory.length > 10) {
                 conversationHistory = conversationHistory.slice(conversationHistory.length - 10);
             }
             
-            // Memory cleanup - safely check if memoryManager exists and handle errors
+            // Memory cleanup
             try {
                 if (typeof memoryManager !== 'undefined') {
                     memoryManager.cleanupMemory();
-                } else {
-                    // Fallback memory cleanup if memoryManager is not available
-                    console.log('Using fallback memory cleanup');
-                    if (typeof tf !== 'undefined') {
-                        try {
-                            const engine = tf.engine();
-                            if (engine && typeof engine.endScope === 'function') {
-                                engine.endScope();
-                            }
-                            if (engine && typeof engine.startScope === 'function') {
-                                engine.startScope();
-                            }
-                        } catch (e) {
-                            console.warn('Error in fallback memory cleanup:', e);
-                        }
-                    }
                 }
             } catch (memoryError) {
                 console.warn('Error during memory cleanup:', memoryError);
-                // Continue execution, don't block the main flow for memory cleanup errors
             }
             
         } catch (error) {
@@ -960,12 +1001,213 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     
     /**
+     * Update tracking of relevant documents to maintain context across queries
+     * @param {Array<Object>} chunks - Chunks that were relevant to the query
+     */
+    function updateLastRelevantDocuments(chunks) {
+        // Track unique document IDs that contained relevant chunks
+        const docIds = [...new Set(chunks.map(chunk => chunk.documentId))];
+        
+        // Get chunk counts per document
+        const docChunkCounts = {};
+        docIds.forEach(docId => {
+            docChunkCounts[docId] = chunks.filter(chunk => chunk.documentId === docId).length;
+        });
+        
+        // Store with document ID and relevance score (based on chunk count)
+        lastRelevantDocuments = docIds.map(docId => ({
+            documentId: docId,
+            relevanceScore: docChunkCounts[docId] / chunks.length
+        }));
+        
+        console.log('Updated relevant documents tracking:', lastRelevantDocuments);
+    }
+
+    /**
+     * Perform search with fallback strategies
+     * @param {string} question - User's question
+     * @param {Array<number>} documentIds - Selected document IDs
+     * @param {Array<Object>} conversationHistory - Previous conversation
+     * @param {Array<string>} originalTerms - Original search terms
+     * @returns {Promise<{chunks: Array<Object>, usedFallback: boolean}>} Search results with metadata
+     */
+    async function performSearchWithFallbacks(question, documentIds, conversationHistory, originalTerms) {
+        // Step 1: Try initial standard search with contextual awareness
+        console.log('Performing context-aware search...');
+        let searchResults = await performStandardSearch(question, documentIds, true);
+        
+        // Return immediately if we found good results
+        if (searchResults.chunks.length > 0) {
+            return {
+                chunks: searchResults.chunks,
+                usedFallback: false
+            };
+        }
+        
+        // Step 2: If no results, try without context awareness (fresh search)
+        console.log('No results with context. Trying standard search...');
+        searchResults = await performStandardSearch(question, documentIds, false);
+        
+        if (searchResults.chunks.length > 0) {
+            return {
+                chunks: searchResults.chunks,
+                usedFallback: false
+            };
+        }
+        
+        // Step 3: If still no results, try fallback with related terms
+        console.log('No results found, trying related terms...');
+        const relatedTerms = await llmConnector.findRelatedTerms(question, originalTerms, conversationHistory);
+        console.log('Related terms:', relatedTerms);
+        
+        if (relatedTerms && relatedTerms.length > 0) {
+            // Create expanded question using related terms
+            const expandedQuestion = `${question} ${relatedTerms.join(' ')}`;
+            searchResults = await performStandardSearch(expandedQuestion, documentIds, false);
+            
+            if (searchResults.chunks.length > 0) {
+                return {
+                    chunks: searchResults.chunks,
+                    usedFallback: true
+                };
+            }
+        }
+        
+        // No results even with expanded search
+        return {
+            chunks: [],
+            usedFallback: false
+        };
+    }
+    
+    /**
+     * Perform the standard search process
+     * @param {string} question - User's question
+     * @param {Array<number>} documentIds - Selected document IDs
+     * @param {boolean} useContext - Whether to use context from previous queries
+     * @returns {Promise<{chunks: Array<Object>}>} Search results
+     */
+    async function performStandardSearch(question, documentIds, useContext = true) {
+        // Step 1: Calculate query similarity with previous query if useContext is true
+        const questionEmbedding = await vectorizer.vectorize(question);
+        let queryContextualScore = 0;
+        
+        // Check if current query is similar to the previous one
+        if (useContext && lastQueryEmbedding) {
+            queryContextualScore = vectorizer.cosineSimilarity(questionEmbedding, lastQueryEmbedding);
+            console.log('Query similarity with previous:', queryContextualScore);
+        }
+        
+        // Update the last query embedding for future reference
+        lastQueryEmbedding = questionEmbedding;
+        
+        // Prioritize documents that were relevant for similar queries
+        const prioritizedDocIds = [...documentIds];
+        
+        // If query is contextually related (similarity > 0.7) and we have previous relevant documents
+        const isContextualFollow = queryContextualScore > 0.7 && lastRelevantDocuments.length > 0;
+        
+        if (useContext && isContextualFollow) {
+            console.log('Using contextual document prioritization for follow-up query');
+            
+            // Custom search approach for contextual queries
+            const embeddingChunks = await docDB.findSimilarChunks(questionEmbedding, 8, documentIds);
+            
+            // Prioritize chunks from previously relevant documents
+            const relevantDocIds = lastRelevantDocuments.map(doc => doc.documentId);
+            const prioritizedChunks = embeddingChunks.map(chunk => {
+                // Boost score for chunks from recently relevant documents
+                const docRelevance = lastRelevantDocuments.find(d => d.documentId === chunk.documentId);
+                const contextBoost = docRelevance ? docRelevance.relevanceScore * 0.15 : 0;
+                
+                return {
+                    ...chunk,
+                    similarity: chunk.similarity + contextBoost,
+                    boostedForContext: !!docRelevance
+                };
+            });
+            
+            // Resort after boosting
+            prioritizedChunks.sort((a, b) => b.similarity - a.similarity);
+            
+            // Special term-based search targeting relevant documents first
+            let allSelectedChunks = [];
+            
+            // First get chunks from previously relevant documents
+            for (const docId of relevantDocIds) {
+                if (documentIds.includes(docId)) {
+                    const docChunks = await docDB.getAllChunks(docId);
+                    allSelectedChunks = [...allSelectedChunks, ...docChunks];
+                }
+            }
+            
+            // Then get chunks from other documents if needed
+            const otherDocIds = documentIds.filter(id => !relevantDocIds.includes(id));
+            for (const docId of otherDocIds) {
+                const docChunks = await docDB.getAllChunks(docId);
+                allSelectedChunks = [...allSelectedChunks, ...docChunks];
+            }
+            
+            const termBasedChunks = termSearch.search(question, allSelectedChunks, 8);
+            
+            // Merge results with contextual awareness
+            const mergedChunks = mergeSearchResults(prioritizedChunks, termBasedChunks, isContextualFollow);
+            
+            // If we have enough chunks, return them
+            if (mergedChunks.length > 0) {
+                // Debug what documents the chunks came from
+                const resultDocumentCounts = {};
+                mergedChunks.forEach(chunk => {
+                    resultDocumentCounts[chunk.documentId] = (resultDocumentCounts[chunk.documentId] || 0) + 1;
+                });
+                console.log('Chunks per document in contextual results:', resultDocumentCounts);
+                
+                return {
+                    chunks: mergedChunks
+                };
+            }
+        }
+        
+        // Fall back to standard search if contextual approach failed or wasn't used
+        console.log('Using standard search approach');
+        
+        // Method A: Traditional embedding similarity search
+        const embeddingChunks = await docDB.findSimilarChunks(questionEmbedding, 8, documentIds);
+        
+        // Method B: Term-based search
+        // Gather chunks from all selected documents
+        let allSelectedChunks = [];
+        for (const docId of documentIds) {
+            const docChunks = await docDB.getAllChunks(docId);
+            allSelectedChunks = [...allSelectedChunks, ...docChunks];
+        }
+        const termBasedChunks = termSearch.search(question, allSelectedChunks, 8);
+        
+        // Step 3: Merge results for better coverage
+        const mergedChunks = mergeSearchResults(embeddingChunks, termBasedChunks);
+        
+        // Step 4: For large result sets, perform multi-stage processing
+        if (mergedChunks.length > 5) {
+            return await processLargeResultSet(question, mergedChunks, conversationHistory);
+        }
+        
+        // Store debugging info
+        window.embeddingChunks = embeddingChunks;
+        window.termBasedChunks = termBasedChunks;
+        
+        return {
+            chunks: mergedChunks
+        };
+    }
+
+    /**
      * Merge and rerank search results from multiple methods
      * @param {Array<Object>} embeddingResults - Results from embedding similarity search
      * @param {Array<Object>} termResults - Results from term-based search
+     * @param {boolean} isContextualQuery - Whether this is a contextual follow-up query
      * @returns {Array<Object>} Merged and reranked results
      */
-    function mergeSearchResults(embeddingResults, termResults) {
+    function mergeSearchResults(embeddingResults, termResults, isContextualQuery = false) {
         // Create a map to track chunks by ID to avoid duplicates
         const chunkMap = new Map();
         
@@ -1008,27 +1250,326 @@ document.addEventListener('DOMContentLoaded', function() {
             const embeddingScore = chunk.embeddingScore || 0;
             const termScore = chunk.termScore || 0;
             
-            // Combined score (weighted sum of normalized scores)
+            // Combined score with increased weight for term-based results and exact matches
             const normalizedEmbeddingScore = embeddingScore;
-            const normalizedTermScore = termScore / 3; // Scale term scores
+            const normalizedTermScore = termScore / 2; // Scale term scores
             
-            // Merged score - 60% embedding, 40% term-based
-            const mergedScore = (normalizedEmbeddingScore * 0.6) + (normalizedTermScore * 0.4);
+            // Merged score - 50% embedding, 50% term-based (increased from 40%)
+            const mergedScore = (normalizedEmbeddingScore * 0.5) + (normalizedTermScore * 0.5);
             
             // Rank boost if found by both methods
-            const rankBoost = chunk.embeddingRank && chunk.termRank ? 0.1 : 0;
+            const rankBoost = chunk.embeddingRank && chunk.termRank ? 0.15 : 0;
+            
+            // Apply contextual boost if available
+            const contextBoost = chunk.boostedForContext ? 0.1 : 0;
             
             return {
                 ...chunk,
-                mergedScore: mergedScore + rankBoost
+                mergedScore: mergedScore + rankBoost + contextBoost
             };
         });
         
-        // Sort by merged score (descending)
-        combinedResults.sort((a, b) => b.mergedScore - a.mergedScore);
+        // Group by document ID
+        const docGroups = {};
+        combinedResults.forEach(chunk => {
+            const docId = chunk.documentId;
+            if (!docGroups[docId]) {
+                docGroups[docId] = [];
+            }
+            docGroups[docId].push(chunk);
+        });
         
-        // Return top chunks (max of 5)
-        return combinedResults.slice(0, 5);
+        // Debug document representation
+        console.log('Document representation in search results:', 
+            Object.entries(docGroups).map(([docId, chunks]) => 
+                `Document ${docId}: ${chunks.length} chunks`));
+        
+        // Ensure each document gets at least one high-ranking chunk if possible
+        const ensuredResults = [];
+        let documentsInResults = Object.keys(docGroups);
+        
+        // For contextual queries, prioritize previously relevant documents 
+        if (isContextualQuery && lastRelevantDocuments.length > 0) {
+            // Sort document IDs by their previous relevance
+            documentsInResults.sort((a, b) => {
+                const aRelevance = lastRelevantDocuments.find(d => d.documentId === parseInt(a))?.relevanceScore || 0;
+                const bRelevance = lastRelevantDocuments.find(d => d.documentId === parseInt(b))?.relevanceScore || 0;
+                return bRelevance - aRelevance; // Higher relevance first
+            });
+            
+            console.log('Documents sorted by previous relevance:', documentsInResults);
+        }
+        
+        // First, add the top chunk from each document
+        documentsInResults.forEach(docId => {
+            if (docGroups[docId].length > 0) {
+                // Sort document chunks by score
+                docGroups[docId].sort((a, b) => b.mergedScore - a.mergedScore);
+                // Add the top chunk from this document
+                ensuredResults.push(docGroups[docId][0]);
+                // Remove the added chunk
+                docGroups[docId].shift();
+            }
+        });
+        
+        // Then add remaining chunks based on score
+        const remainingChunks = [].concat(...Object.values(docGroups));
+        remainingChunks.sort((a, b) => b.mergedScore - a.mergedScore);
+        
+        // Combine ensured results with remaining top chunks
+        const finalResults = [...ensuredResults, ...remainingChunks]
+            .slice(0, 8); // Keep up to 8 chunks (increased from 5)
+        
+        // Sort by score again to put them in proper order
+        finalResults.sort((a, b) => b.mergedScore - a.mergedScore);
+        
+        console.log('Final merged results:', finalResults.map(c => ({
+            documentId: c.documentId,
+            documentTitle: c.documentTitle || `Document ${c.documentId}`,
+            score: c.mergedScore.toFixed(3),
+            terms: c.terms,
+            text: c.text.substring(0, 50) + '...'
+        })));
+        
+        return finalResults;
+    }
+
+    /**
+     * Process large result sets through a multi-stage approach
+     * @param {string} question - User's question
+     * @param {Array<Object>} mergedChunks - Combined chunks from multiple search methods
+     * @param {Array<Object>} conversationHistory - Previous conversation context
+     * @returns {Promise<{chunks: Array<Object>}>} Filtered and processed chunks
+     */
+    async function processLargeResultSet(question, mergedChunks, conversationHistory) {
+        console.log(`Processing large result set with ${mergedChunks.length} chunks`);
+        
+        // Sort results by score (highest first)
+        const sortedChunks = [...mergedChunks].sort((a, b) => b.mergedScore - a.mergedScore);
+        
+        // Group chunks by document
+        const documentGroups = {};
+        sortedChunks.forEach(chunk => {
+            const docId = chunk.documentId;
+            if (!documentGroups[docId]) {
+                documentGroups[docId] = [];
+            }
+            documentGroups[docId].push(chunk);
+        });
+        
+        // For each document, keep only the best chunks
+        let prioritizedChunks = [];
+        Object.values(documentGroups).forEach(chunks => {
+            // Take the highest scoring chunks from each document (at most 3 per document)
+            prioritizedChunks = prioritizedChunks.concat(chunks.slice(0, 3));
+        });
+        
+        // Re-sort by score and take the top chunks (never exceeding 8 total)
+        prioritizedChunks.sort((a, b) => b.mergedScore - a.mergedScore);
+        const finalChunks = prioritizedChunks.slice(0, 8);
+        
+        console.log(`Reduced large result set from ${mergedChunks.length} to ${finalChunks.length} chunks`);
+        
+        // If the size is still too large for optimal processing, we could add a second stage:
+        // - Summarize groups of chunks
+        // - Cluster chunks by topic similarity
+        // - Use LLM to select most relevant chunks
+        
+        return {
+            chunks: finalChunks
+        };
+    }
+
+    /**
+     * Ensure chat scrolls to the bottom to show newest messages
+     * Using requestAnimationFrame for better scroll timing after DOM updates
+     */
+    function scrollChatToBottom() {
+        // Use requestAnimationFrame to ensure DOM is fully updated before scrolling
+        requestAnimationFrame(() => {
+            // Scroll to bottom
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            
+            // Double-check scroll after a small delay (for images or dynamic content)
+            setTimeout(() => {
+                chatMessages.scrollTop = chatMessages.scrollHeight;
+            }, 100);
+        });
+    }
+
+    /**
+     * Load all documents into the document selection panel
+     */
+    async function loadDocumentSelectionPanel() {
+        try {
+            const documents = await docDB.getAllDocuments();
+            const selectionList = document.getElementById('documentSelectionList');
+            availableDocuments = documents;
+            
+            if (!selectionList) return;
+            
+            // Sort by date processed (newest first)
+            documents.sort((a, b) => new Date(b.dateProcessed) - new Date(a.dateProcessed));
+            
+            if (documents.length === 0) {
+                selectionList.innerHTML = `
+                    <div class="text-center text-muted py-2 small">
+                        <em>No documents available. Upload a document first.</em>
+                    </div>
+                `;
+                return;
+            }
+            
+            selectionList.innerHTML = '';
+            
+            // Add a header explaining document selection
+            const headerElement = document.createElement('div');
+            headerElement.className = 'document-selection-header';
+            headerElement.innerHTML = `
+                <div class="alert alert-info py-2 mb-2">
+                    <i class="bi bi-info-circle-fill"></i> 
+                    Selected documents are used for answering questions
+                </div>
+            `;
+            selectionList.appendChild(headerElement);
+            
+            // Create an item for each document
+            documents.forEach(doc => {
+                // Check if this is the current document
+                const isCurrentDoc = currentDocument && currentDocument.id === doc.id;
+                // Add current document to selected by default
+                if (isCurrentDoc && !selectedDocuments.includes(doc.id)) {
+                    selectedDocuments.push(doc.id);
+                }
+                
+                const docItem = document.createElement('div');
+                docItem.className = 'document-selection-item';
+                // Add a highlighted class if this document is selected
+                if (selectedDocuments.includes(doc.id)) {
+                    docItem.classList.add('document-selected');
+                }
+                
+                docItem.innerHTML = `
+                    <div class="form-check">
+                        <input class="form-check-input document-checkbox" type="checkbox" 
+                               id="doc-${doc.id}" data-doc-id="${doc.id}" 
+                               ${selectedDocuments.includes(doc.id) ? 'checked' : ''}>
+                        <label class="form-check-label" for="doc-${doc.id}">
+                            <span class="document-title">
+                                ${doc.title}
+                                ${isCurrentDoc ? '<span class="document-active-badge">Active</span>' : ''}
+                            </span>
+                            <span class="document-info">
+                                ${doc.wordCount.toLocaleString()} words · ${new Date(doc.dateProcessed).toLocaleDateString()}
+                            </span>
+                        </label>
+                    </div>
+                `;
+                
+                selectionList.appendChild(docItem);
+                
+                // Add event listener for checkbox
+                const checkbox = docItem.querySelector(`#doc-${doc.id}`);
+                checkbox.addEventListener('change', () => {
+                    if (checkbox.checked) {
+                        addDocumentToSelection(doc.id);
+                        docItem.classList.add('document-selected');
+                    } else {
+                        removeDocumentFromSelection(doc.id);
+                        docItem.classList.remove('document-selected');
+                    }
+                });
+            });
+            
+            // Update the document indicator to reflect current state
+            updateActiveDocumentsIndicator();
+        } catch (error) {
+            console.error('Error loading documents for selection:', error);
+        }
+    }
+    
+    /**
+     * Add a document to the selection
+     * @param {number} docId - Document ID to add
+     */
+    function addDocumentToSelection(docId) {
+        if (!selectedDocuments.includes(docId)) {
+            selectedDocuments.push(docId);
+            updateDocumentSelectionUI();
+            
+            // Get document title for user notification
+            docDB.getDocument(docId).then(doc => {
+                if (doc) {
+                    // Update the status in the chat with more specific information
+                    const activeDocsMessage = selectedDocuments.length > 1 ? 
+                        ` (${selectedDocuments.length} documents now active)` : '';
+                    addSystemMessage(`Added "${doc.title}" to the conversation context.${activeDocsMessage} You can now ask questions about this document.`);
+                }
+            });
+        }
+    }
+    
+    /**
+     * Remove a document from the selection
+     * @param {number} docId - Document ID to remove
+     */
+    function removeDocumentFromSelection(docId) {
+        // Get document title before removing from list
+        docDB.getDocument(docId).then(doc => {
+            const docTitle = doc ? doc.title : `Document ${docId}`;
+            
+            // Now remove from selection
+            selectedDocuments = selectedDocuments.filter(id => id !== docId);
+            updateDocumentSelectionUI();
+            
+            // Create message with remaining documents information
+            let message = `Removed "${docTitle}" from context.`;
+            
+            if (selectedDocuments.length > 0) {
+                // Add information about remaining documents
+                if (selectedDocuments.length === 1) {
+                    docDB.getDocument(selectedDocuments[0]).then(remainingDoc => {
+                        if (remainingDoc) {
+                            addSystemMessage(`${message} Now using only "${remainingDoc.title}" for context.`);
+                        }
+                    });
+                } else {
+                    message += ` ${selectedDocuments.length} documents remain in context.`;
+                    addSystemMessage(message);
+                }
+            } else {
+                addSystemMessage(`${message} Please select at least one document to continue.`);
+            }
+        });
+    }
+    
+    /**
+     * Select all available documents
+     */
+    function selectAllDocuments() {
+        selectedDocuments = availableDocuments.map(doc => doc.id);
+        updateDocumentSelectionUI();
+        addSystemMessage(`All ${availableDocuments.length} documents are now in context. You can ask questions about any document.`);
+    }
+    
+    /**
+     * Deselect all documents
+     */
+    function deselectAllDocuments() {
+        selectedDocuments = [];
+        updateDocumentSelectionUI();
+        addSystemMessage(`Removed all documents from context. Please select at least one document to continue.`);
+    }
+    
+    /**
+     * Update the document selection UI to reflect current selections
+     */
+    function updateDocumentSelectionUI() {
+        // Update all checkboxes to match selectedDocuments array
+        document.querySelectorAll('.document-checkbox').forEach(checkbox => {
+            const docId = parseInt(checkbox.dataset.docId);
+            checkbox.checked = selectedDocuments.includes(docId);
+        });
     }
 
     // Function to clear the chat history
@@ -1070,22 +1611,95 @@ document.addEventListener('DOMContentLoaded', function() {
         setupEventListeners();
         
         try {
-            // Pre-load TensorFlow.js model
             await vectorizer.loadModel();
             
-            // Check if any documents exist in the database
             const documents = await docDB.getAllDocuments();
             if (documents.length > 0) {
-                // Show library instead of loading the most recent document
+                showLibrarySection();
+            } else {
                 showLibrarySection();
             }
             
+            // Add a floating indicator to show which documents are active
+            createActiveDocumentsIndicator();
+            
         } catch (error) {
             console.error('Error initializing app:', error);
-            // Continue anyway - we'll handle errors later
         }
     }
     
+    /**
+     * Create a floating indicator showing which documents are currently active
+     */
+    async function createActiveDocumentsIndicator() {
+        // Create element if it doesn't exist
+        let indicator = document.getElementById('active-documents-indicator');
+        if (!indicator) {
+            indicator = document.createElement('div');
+            indicator.id = 'active-documents-indicator';
+            indicator.className = 'active-documents-indicator';
+            document.body.appendChild(indicator);
+            
+            // Add a subtle style that doesn't interfere with UI
+            const style = document.createElement('style');
+            style.textContent = `
+                .active-documents-indicator {
+                    position: fixed;
+                    bottom: 10px;
+                    left: 10px;
+                    background: rgba(0,0,0,0.6);
+                    color: white;
+                    padding: 5px 10px;
+                    border-radius: 15px;
+                    font-size: 12px;
+                    z-index: 1000;
+                    max-width: 300px;
+                    opacity: 0.7;
+                    transition: opacity 0.3s;
+                }
+                .active-documents-indicator:hover {
+                    opacity: 0.9;
+                }
+                .active-documents-indicator .doc-name {
+                    display: inline-block;
+                    background: rgba(255,255,255,0.2);
+                    padding: 1px 5px;
+                    margin: 2px;
+                    border-radius: 3px;
+                }
+            `;
+            document.head.appendChild(style);
+        }
+        
+        // Update periodically to ensure it reflects current state
+        updateActiveDocumentsIndicator();
+        setInterval(updateActiveDocumentsIndicator, 5000);
+    }
+    
+    /**
+     * Update the active documents indicator with current selection
+     */
+    async function updateActiveDocumentsIndicator() {
+        const indicator = document.getElementById('active-documents-indicator');
+        if (!indicator) return;
+        
+        if (selectedDocuments.length === 0) {
+            indicator.innerHTML = 'No documents selected';
+            return;
+        }
+        
+        // Get document titles
+        const docTitles = await Promise.all(selectedDocuments.map(async id => {
+            const doc = await docDB.getDocument(id);
+            return doc ? doc.title : `Document ${id}`;
+        }));
+        
+        // Update indicator content
+        indicator.innerHTML = 'Active docs: ' + docTitles.map(title => 
+            `<span class="doc-name">${title.substring(0, 15)}${title.length > 15 ? '...' : ''}</span>`
+        ).join(' ');
+    }
+
     // Start the app
     init();
 });

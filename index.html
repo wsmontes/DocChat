@@ -106,6 +106,27 @@
                                 <!-- Vector stats will be displayed here -->
                             </div>
                             <hr>
+                            <!-- New Document Selection Panel -->
+                            <div class="mb-3">
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <h6 class="mb-0">Documents in Context</h6>
+                                    <div>
+                                        <button id="selectAllDocs" class="btn btn-sm btn-outline-primary me-1" title="Select All Documents">
+                                            <i class="bi bi-check-all"></i>
+                                        </button>
+                                        <button id="selectNoneDocs" class="btn btn-sm btn-outline-secondary" title="Deselect All">
+                                            <i class="bi bi-x-lg"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                <div id="documentSelectionList" class="document-selection-list">
+                                    <!-- Documents will be listed here with checkboxes -->
+                                    <div class="text-center text-muted py-2 small">
+                                        <em>Loading available documents...</em>
+                                    </div>
+                                </div>
+                            </div>
+                            <hr>
                             <div class="d-flex flex-column gap-2">
                                 <button id="exportEmbeddingsBtn" class="btn btn-outline-primary w-100">
                                     <i class="bi bi-upload"></i> Export Embeddings
