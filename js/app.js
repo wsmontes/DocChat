@@ -1401,16 +1401,36 @@ document.addEventListener('DOMContentLoaded', function() {
      * Load all documents into the document selection panel
      */
     async function loadDocumentSelectionPanel() {
+        const selectionList = document.getElementById('documentSelectionList');
+        if (!selectionList) return;
+        
+        // Start with loading indicator
+        selectionList.innerHTML = `
+            <div class="text-center text-muted py-2 small">
+                <em>Loading available documents...</em>
+            </div>
+        `;
+        
         try {
+            // Check if we're running on GitHub Pages
+            const isGitHubPages = window.location.hostname.includes('github.io');
+            console.log('Environment check:', isGitHubPages ? 'Running on GitHub Pages' : 'Running locally');
+            
+            // Add a small delay for GitHub Pages to ensure IndexedDB is ready
+            if (isGitHubPages) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            
             const documents = await docDB.getAllDocuments();
-            const selectionList = document.getElementById('documentSelectionList');
             availableDocuments = documents;
             
-            if (!selectionList) return;
+            // Clear the loading message
+            selectionList.innerHTML = '';
             
             // Sort by date processed (newest first)
             documents.sort((a, b) => new Date(b.dateProcessed) - new Date(a.dateProcessed));
             
+            // Handle empty document list
             if (documents.length === 0) {
                 selectionList.innerHTML = `
                     <div class="text-center text-muted py-2 small">
@@ -1419,8 +1439,6 @@ document.addEventListener('DOMContentLoaded', function() {
                 `;
                 return;
             }
-            
-            selectionList.innerHTML = '';
             
             // Add a header explaining document selection
             const headerElement = document.createElement('div');
@@ -1485,9 +1503,31 @@ document.addEventListener('DOMContentLoaded', function() {
             updateActiveDocumentsIndicator();
         } catch (error) {
             console.error('Error loading documents for selection:', error);
+            
+            // Show error message instead of perpetual loading
+            selectionList.innerHTML = `
+                <div class="alert alert-warning py-2 mb-2">
+                    <i class="bi bi-exclamation-triangle"></i> 
+                    Unable to load documents. 
+                    ${error.message ? `<br><small class="text-muted">${error.message}</small>` : ''}
+                </div>
+                <div class="text-center mt-2">
+                    <button class="btn btn-sm btn-outline-primary refresh-docs-btn">
+                        <i class="bi bi-arrow-clockwise"></i> Try Again
+                    </button>
+                </div>
+            `;
+            
+            // Add click handler for refresh button
+            const refreshBtn = selectionList.querySelector('.refresh-docs-btn');
+            if (refreshBtn) {
+                refreshBtn.addEventListener('click', () => {
+                    loadDocumentSelectionPanel();
+                });
+            }
         }
     }
-    
+
     /**
      * Add a document to the selection
      * @param {number} docId - Document ID to add

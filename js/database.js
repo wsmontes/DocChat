@@ -9,41 +9,83 @@ class DocumentDatabase {
 
     async initDatabase() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open(this.dbName, this.dbVersion);
+            // Check if IndexedDB is available
+            if (!window.indexedDB) {
+                console.error('IndexedDB not supported in this browser');
+                reject(new Error('IndexedDB is not supported in this browser.'));
+                return;
+            }
+
+            // Check if running on GitHub Pages
+            const isGitHubPages = window.location.hostname.includes('github.io');
+            if (isGitHubPages) {
+                console.log('Running on GitHub Pages - adding extra safeguards for IndexedDB');
+            }
             
-            request.onupgradeneeded = (event) => {
-                const db = event.target.result;
+            try {
+                const request = indexedDB.open(this.dbName, this.dbVersion);
                 
-                // Create document store
-                if (!db.objectStoreNames.contains('documents')) {
-                    const docStore = db.createObjectStore('documents', { keyPath: 'id', autoIncrement: true });
-                    docStore.createIndex('title', 'title', { unique: false });
-                    docStore.createIndex('dateProcessed', 'dateProcessed', { unique: false });
-                }
+                request.onupgradeneeded = (event) => {
+                    const db = event.target.result;
+                    
+                    // Create document store
+                    if (!db.objectStoreNames.contains('documents')) {
+                        const docStore = db.createObjectStore('documents', { keyPath: 'id', autoIncrement: true });
+                        docStore.createIndex('title', 'title', { unique: false });
+                        docStore.createIndex('dateProcessed', 'dateProcessed', { unique: false });
+                    }
+                    
+                    // Create chunks store
+                    if (!db.objectStoreNames.contains('chunks')) {
+                        const chunkStore = db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
+                        chunkStore.createIndex('documentId', 'documentId', { unique: false });
+                        chunkStore.createIndex('embedding', 'embedding', { unique: false });
+                    }
+                    
+                    // Create metadata store
+                    if (!db.objectStoreNames.contains('metadata')) {
+                        const metaStore = db.createObjectStore('metadata', { keyPath: 'key' });
+                    }
+                };
                 
-                // Create chunks store
-                if (!db.objectStoreNames.contains('chunks')) {
-                    const chunkStore = db.createObjectStore('chunks', { keyPath: 'id', autoIncrement: true });
-                    chunkStore.createIndex('documentId', 'documentId', { unique: false });
-                    chunkStore.createIndex('embedding', 'embedding', { unique: false });
-                }
+                request.onsuccess = (event) => {
+                    this.db = event.target.result;
+                    this.isReady = true;
+                    
+                    // On GitHub Pages, verify connection with a simple test
+                    if (isGitHubPages) {
+                        try {
+                            const testTx = this.db.transaction(['metadata'], 'readonly');
+                            testTx.oncomplete = () => {
+                                console.log('IndexedDB connection verified');
+                            };
+                        } catch (e) {
+                            console.warn('IndexedDB test transaction failed:', e);
+                        }
+                    }
+                    
+                    resolve();
+                };
                 
-                // Create metadata store
-                if (!db.objectStoreNames.contains('metadata')) {
-                    const metaStore = db.createObjectStore('metadata', { keyPath: 'key' });
+                request.onerror = (event) => {
+                    console.error('IndexedDB error:', event.target.error);
+                    reject(event.target.error);
+                };
+                
+                // Add timeout for GitHub Pages to prevent hanging
+                if (isGitHubPages) {
+                    setTimeout(() => {
+                        if (!this.isReady) {
+                            const error = new Error('IndexedDB initialization timed out');
+                            console.error(error);
+                            reject(error);
+                        }
+                    }, 5000); // 5 second timeout
                 }
-            };
-            
-            request.onsuccess = (event) => {
-                this.db = event.target.result;
-                this.isReady = true;
-                resolve();
-            };
-            
-            request.onerror = (event) => {
-                console.error('IndexedDB error:', event.target.error);
-                reject(event.target.error);
-            };
+            } catch (error) {
+                console.error('Error during IndexedDB initialization:', error);
+                reject(error);
+            }
         });
     }
     
