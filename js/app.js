@@ -35,6 +35,10 @@ document.addEventListener('DOMContentLoaded', function() {
     const selectAllDocs = document.getElementById('selectAllDocs');
     const selectNoneDocs = document.getElementById('selectNoneDocs');
     const documentSelectionList = document.getElementById('documentSelectionList');
+    const processQueueBtn = document.getElementById('processQueueBtn');
+    const clearQueueBtn = document.getElementById('clearQueueBtn');
+    const uploadQueue = document.getElementById('uploadQueue');
+    const queuedFiles = document.getElementById('queuedFiles');
     
     // App state
     let isProcessingFile = false;
@@ -42,13 +46,13 @@ document.addEventListener('DOMContentLoaded', function() {
     let initialized = false;
     let messageIdCounter = 0;
     let conversationHistory = [];
-    // New variables for document selection
     let selectedDocuments = [];
     let availableDocuments = [];
-    // Add persistence for query context
     let lastQueryEmbedding = null;
     let lastRelevantDocuments = [];
     let lastQueryTerms = [];
+    let fileQueue = [];
+    let isProcessingQueue = false;
 
     // Setup event listeners
     function setupEventListeners() {
@@ -71,7 +75,7 @@ document.addEventListener('DOMContentLoaded', function() {
             
             const files = e.dataTransfer.files;
             if (files.length > 0) {
-                processFile(files[0]);
+                addFilesToQueue(files);
             }
         });
         
@@ -93,7 +97,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (isProcessingFile) return;
             
             if (fileInput.files.length > 0) {
-                processFile(fileInput.files[0]);
+                addFilesToQueue(fileInput.files);
             }
         });
         
@@ -198,11 +202,257 @@ document.addEventListener('DOMContentLoaded', function() {
                 deselectAllDocuments();
             });
         }
+
+        // Add queue processing button handler
+        if (processQueueBtn) {
+            processQueueBtn.addEventListener('click', () => {
+                processNextInQueue();
+            });
+        }
+        
+        // Add clear queue button handler
+        if (clearQueueBtn) {
+            clearQueueBtn.addEventListener('click', () => {
+                clearFileQueue();
+            });
+        }
+    }
+    
+    function addFilesToQueue(files) {
+        uploadQueue.classList.remove('d-none');
+        
+        Array.from(files).forEach(file => {
+            if (file.size > 100 * 1024 * 1024) {
+                showFileError(file, 'File is too large (max 100MB)');
+                return;
+            }
+            
+            if (!documentProcessor.isFileSupported(file)) {
+                showFileError(file, 'Unsupported file type');
+                return;
+            }
+            
+            const queueId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+            const queueItem = {
+                id: queueId,
+                file: file,
+                status: 'queued',
+                progress: 0
+            };
+            
+            fileQueue.push(queueItem);
+            
+            const fileElement = createQueuedFileElement(queueItem);
+            queuedFiles.appendChild(fileElement);
+        });
+        
+        if (!isProcessingQueue && !isProcessingFile) {
+            processNextInQueue();
+        }
+    }
+    
+    function createQueuedFileElement(queueItem) {
+        const file = queueItem.file;
+        const fileElement = document.createElement('div');
+        fileElement.className = 'queued-file';
+        fileElement.id = `queue-item-${queueItem.id}`;
+        
+        let fileIcon = 'file-text';
+        if (file.name.endsWith('.pdf')) {
+            fileIcon = 'file-pdf';
+        } else if (file.name.endsWith('.csv') || file.name.endsWith('.xlsx') || file.name.endsWith('.xls')) {
+            fileIcon = 'file-spreadsheet';
+        } else if (file.name.endsWith('.md')) {
+            fileIcon = 'markdown';
+        } else if (file.name.endsWith('.html')) {
+            fileIcon = 'code-slash';
+        }
+        
+        fileElement.innerHTML = `
+            <div class="file-icon">
+                <i class="bi bi-${fileIcon}"></i>
+            </div>
+            <div class="file-info">
+                <div class="file-name">${file.name}</div>
+                <div class="file-size">${formatFileSize(file.size)}</div>
+                <div class="file-progress">
+                    <div class="file-progress-bar" style="width: 0%"></div>
+                </div>
+            </div>
+            <div class="file-status">Queued</div>
+            <div class="file-actions">
+                <button class="btn btn-sm btn-link text-danger remove-file" aria-label="Remove file">
+                    <i class="bi bi-x"></i>
+                </button>
+            </div>
+        `;
+        
+        const removeBtn = fileElement.querySelector('.remove-file');
+        removeBtn.addEventListener('click', () => {
+            removeFromQueue(queueItem.id);
+        });
+        
+        return fileElement;
+    }
+    
+    function formatFileSize(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        else if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+        else return (bytes / 1048576).toFixed(1) + ' MB';
+    }
+    
+    function removeFromQueue(queueId) {
+        fileQueue = fileQueue.filter(item => item.id !== queueId);
+        
+        const fileElement = document.getElementById(`queue-item-${queueId}`);
+        if (fileElement) {
+            fileElement.remove();
+        }
+        
+        if (fileQueue.length === 0) {
+            uploadQueue.classList.add('d-none');
+        }
+    }
+    
+    function clearFileQueue() {
+        if (isProcessingQueue || isProcessingFile) {
+            const confirm = window.confirm('Processing is in progress. Are you sure you want to clear the queue?');
+            if (!confirm) return;
+        }
+        
+        fileQueue = [];
+        queuedFiles.innerHTML = '';
+        uploadQueue.classList.add('d-none');
+        isProcessingQueue = false;
+    }
+    
+    function processNextInQueue() {
+        if (isProcessingFile || fileQueue.length === 0) {
+            isProcessingQueue = false;
+            return;
+        }
+        
+        isProcessingQueue = true;
+        
+        const nextItem = fileQueue.find(item => item.status === 'queued');
+        
+        if (!nextItem) {
+            isProcessingQueue = false;
+            return;
+        }
+        
+        updateQueueItemStatus(nextItem.id, 'processing');
+        
+        processFile(nextItem.file, nextItem.id)
+            .then(() => {
+                updateQueueItemStatus(nextItem.id, 'completed');
+                
+                setTimeout(() => {
+                    processNextInQueue();
+                }, 500);
+            })
+            .catch(error => {
+                console.error('Error processing file:', error);
+                updateQueueItemStatus(nextItem.id, 'error', error.message);
+                
+                setTimeout(() => {
+                    processNextInQueue();
+                }, 500);
+            });
+    }
+    
+    function updateQueueItemStatus(queueId, status, errorMessage = null) {
+        const queueItem = fileQueue.find(item => item.id === queueId);
+        if (queueItem) {
+            queueItem.status = status;
+        }
+        
+        const fileElement = document.getElementById(`queue-item-${queueId}`);
+        if (!fileElement) return;
+        
+        fileElement.classList.remove('queued', 'processing', 'completed', 'error');
+        fileElement.classList.add(status);
+        
+        const statusElement = fileElement.querySelector('.file-status');
+        
+        if (status === 'queued') {
+            statusElement.textContent = 'Queued';
+        } else if (status === 'processing') {
+            statusElement.textContent = 'Processing...';
+        } else if (status === 'completed') {
+            statusElement.innerHTML = '<i class="bi bi-check-circle text-success"></i> Completed';
+        } else if (status === 'error') {
+            statusElement.innerHTML = '<i class="bi bi-exclamation-circle text-danger"></i> Error';
+            if (errorMessage) {
+                fileElement.setAttribute('title', errorMessage);
+                fileElement.setAttribute('data-bs-toggle', 'tooltip');
+                fileElement.setAttribute('data-bs-placement', 'top');
+                new bootstrap.Tooltip(fileElement);
+            }
+        }
+    }
+    
+    function updateQueueItemProgress(queueId, progress, message = null) {
+        const queueItem = fileQueue.find(item => item.id === queueId);
+        if (queueItem) {
+            queueItem.progress = progress;
+        }
+        
+        const fileElement = document.getElementById(`queue-item-${queueId}`);
+        if (!fileElement) return;
+        
+        const progressBar = fileElement.querySelector('.file-progress-bar');
+        if (progressBar) {
+            progressBar.style.width = `${Math.round(progress * 100)}%`;
+        }
+        
+        if (message) {
+            const statusElement = fileElement.querySelector('.file-status');
+            statusElement.textContent = message;
+        }
+    }
+    
+    function showFileError(file, errorMessage) {
+        uploadQueue.classList.remove('d-none');
+        
+        const queueId = Date.now() + '-' + Math.random().toString(36).substr(2, 9);
+        const fileElement = document.createElement('div');
+        fileElement.className = 'queued-file error';
+        fileElement.id = `queue-item-${queueId}`;
+        
+        fileElement.innerHTML = `
+            <div class="file-icon">
+                <i class="bi bi-file-text"></i>
+            </div>
+            <div class="file-info">
+                <div class="file-name">${file.name}</div>
+                <div class="file-size">${formatFileSize(file.size)}</div>
+            </div>
+            <div class="file-status">
+                <i class="bi bi-exclamation-circle text-danger"></i> ${errorMessage}
+            </div>
+            <div class="file-actions">
+                <button class="btn btn-sm btn-link text-danger remove-file" aria-label="Remove file">
+                    <i class="bi bi-x"></i>
+                </button>
+            </div>
+        `;
+        
+        const removeBtn = fileElement.querySelector('.remove-file');
+        removeBtn.addEventListener('click', () => {
+            fileElement.remove();
+            
+            if (queuedFiles.children.length === 0) {
+                uploadQueue.classList.add('d-none');
+            }
+        });
+        
+        queuedFiles.appendChild(fileElement);
     }
     
     // Process the uploaded file
-    async function processFile(file) {
-        if (isProcessingFile) return;
+    async function processFile(file, queueId = null) {
+        if (isProcessingFile && !queueId) return;
         
         // Check if file is too large (add a warning for extremely large files)
         const MAX_FILE_SIZE_WARNING = 50 * 1024 * 1024; // 50MB
@@ -229,15 +479,26 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         
         isProcessingFile = true;
-        showProcessingSection();
         
-        // Ensure UI is updated before starting intensive processing
+        if (!queueId) {
+            showProcessingSection();
+        }
+        
         await new Promise(resolve => setTimeout(resolve, 50));
         
         try {
-            // Step 1: Extract text from file
             console.log(`Processing file: ${file.name} (${(file.size/1024/1024).toFixed(2)} MB)`);
-            updateProcessingStatus(0.1, 'Extracting text from document...');
+            
+            const updateProgress = (progress, message) => {
+                if (queueId) {
+                    updateQueueItemProgress(queueId, progress, message);
+                } else {
+                    updateProcessingStatus(progress, message);
+                }
+            };
+            
+            // Step 1: Extract text from file
+            updateProgress(0.1, 'Extracting text from document...');
             
             // Set timeout for very large files to prevent browser from showing "page unresponsive" dialog
             let extractionTimeout;
@@ -265,7 +526,7 @@ document.addEventListener('DOMContentLoaded', function() {
             
             // Extract text with improved progress reporting
             const text = await documentProcessor.extractTextFromFile(file, (progress, message) => {
-                updateProcessingStatus(progress, message);
+                updateProgress(progress, message);
                 // Ensure UI is updated by forcing a reflow
                 void document.body.offsetHeight;
             });
@@ -288,29 +549,29 @@ document.addEventListener('DOMContentLoaded', function() {
             console.log(`Text ends with: "...${text.substring(text.length - 100)}"`);
             
             // Step 2: Extract metadata
-            updateProcessingStatus(0.5, 'Analyzing document...');
+            updateProgress(0.5, 'Analyzing document...');
             const metadata = documentProcessor.extractMetadata(text, file);
             
             // Step 3: Chunk the document with intermediate UI updates
-            updateProcessingStatus(0.6, 'Chunking document...');
+            updateProgress(0.6, 'Chunking document...');
             
             // For large texts, split the chunking process to allow UI updates
             let chunks;
             if (text.length > 1000000) { // For texts > 1MB
-                updateProcessingStatus(0.6, 'Breaking down large document...');
+                updateProgress(0.6, 'Breaking down large document...');
                 // Yield to the UI thread before starting chunking
                 await new Promise(resolve => setTimeout(resolve, 50));
                 chunks = await documentProcessor.chunkDocument(text, (progress, message) => {
                     // Map the chunking progress (0.6-0.7) to overall progress
                     const overallProgress = 0.6 + (progress - 0.4) * 0.1;
-                    updateProcessingStatus(overallProgress, message);
+                    updateProgress(overallProgress, message);
                 });
             } else {
-                chunks = await documentProcessor.chunkDocument(text, updateProcessingStatus);
+                chunks = await documentProcessor.chunkDocument(text, updateProgress);
             }
             
             // Step 4: Vectorize chunks with better progress indication
-            updateProcessingStatus(0.7, 'Preparing to generate embeddings...');
+            updateProgress(0.7, 'Preparing to generate embeddings...');
             
             // Yield to UI thread before starting vectorization
             await new Promise(resolve => setTimeout(resolve, 50));
@@ -318,11 +579,11 @@ document.addEventListener('DOMContentLoaded', function() {
             const chunkTexts = chunks.map(chunk => chunk.text);
             
             // Ensure the vectorizer model is loaded
-            updateProcessingStatus(0.71, 'Loading vectorization model...');
+            updateProgress(0.71, 'Loading vectorization model...');
             await vectorizer.loadModel();
             
             // Generate embeddings with chunked processing for large datasets
-            updateProcessingStatus(0.75, 'Generating embeddings...');
+            updateProgress(0.75, 'Generating embeddings...');
             
             let embeddings;
             const CHUNKS_PER_BATCH = 20; // Process 20 chunks at a time to prevent freezing
@@ -342,7 +603,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     const end = Math.min(start + CHUNKS_PER_BATCH, chunkTexts.length);
                     const batchTexts = chunkTexts.slice(start, end);
                     
-                    updateProcessingStatus(
+                    updateProgress(
                         0.75 + 0.2 * (batchIndex / totalBatches),
                         `Generating embeddings (batch ${batchIndex + 1}/${totalBatches})...`
                     );
@@ -354,19 +615,19 @@ document.addEventListener('DOMContentLoaded', function() {
                 // For fewer chunks, process all at once
                 embeddings = await vectorizer.vectorizeBatch(chunkTexts, (progress) => {
                     const overallProgress = 0.75 + (progress * 0.2);
-                    updateProcessingStatus(overallProgress, 'Generating embeddings...');
+                    updateProgress(overallProgress, 'Generating embeddings...');
                 });
             }
             
             // Step 5: Prepare vectorized chunks
-            updateProcessingStatus(0.95, 'Finalizing document processing...');
+            updateProgress(0.95, 'Finalizing document processing...');
             const vectorizedChunks = chunks.map((chunk, index) => ({
                 ...chunk,
                 embedding: embeddings[index],
             }));
             
             // Step 6: Store in database
-            updateProcessingStatus(0.98, 'Saving to database...');
+            updateProgress(0.98, 'Saving to database...');
             const documentId = await docDB.storeDocument(metadata, vectorizedChunks);
             metadata.id = documentId;
             
@@ -374,25 +635,32 @@ document.addEventListener('DOMContentLoaded', function() {
             currentDocument = metadata;
             
             // Show chat interface
-            updateProcessingStatus(1, 'Done!');
-            showChatSection();
-            updateDocumentInfo(metadata);
+            updateProgress(1, 'Done!');
             
-            // Add system message
-            addSystemMessage(`I've analyzed the document "${metadata.title}"! Ask me anything about it.`);
-            
-            // Check if API key is configured, if not, prompt user
-            if (!llmConnector.isApiConfigured()) {
-                setTimeout(() => {
-                    addSystemMessage('Please configure your API key to start asking questions.');
-                    apiKeyModal.show();
-                }, 1000);
+            if (!queueId) {
+                showChatSection();
+                updateDocumentInfo(metadata);
+                addSystemMessage(`I've analyzed the document "${metadata.title}"! Ask me anything about it.`);
+                
+                // Check if API key is configured, if not, prompt user
+                if (!llmConnector.isApiConfigured()) {
+                    setTimeout(() => {
+                        addSystemMessage('Please configure your API key to start asking questions.');
+                        apiKeyModal.show();
+                    }, 1000);
+                }
             }
             
+            return documentId;
         } catch (error) {
             console.error('Error processing document:', error);
-            addErrorMessage(`Error processing document: ${error.message}`);
-            showUploadSection();
+            
+            if (!queueId) {
+                addErrorMessage(`Error processing document: ${error.message}`);
+                showUploadSection();
+            }
+            
+            throw error;
         } finally {
             isProcessingFile = false;
             
