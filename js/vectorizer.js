@@ -1,208 +1,296 @@
+/**
+ * Vectorizer class for generating text embeddings
+ * Provides a memory-efficient implementation for converting text to vector embeddings
+ */
 class Vectorizer {
     constructor() {
         this.model = null;
-        this.modelType = 'universal-sentence-encoder';
-        this.isReady = false;
-        this.readyPromise = null;
-        this.cachedModels = {};
-        this.modelStatusElement = document.getElementById('modelStatus');
-        this.modelStatusMessage = document.getElementById('modelStatusMessage');
-    }
-    
-    showModelStatus(message) {
-        if (this.modelStatusElement && this.modelStatusMessage) {
-            this.modelStatusMessage.textContent = message;
-            this.modelStatusElement.classList.remove('d-none');
-        }
-    }
-    
-    hideModelStatus() {
-        if (this.modelStatusElement) {
-            this.modelStatusElement.classList.add('d-none');
-        }
-    }
-    
-    async loadModel(modelType = 'universal-sentence-encoder') {
-        // Check if we already have this model cached
-        if (this.cachedModels[modelType]) {
-            this.model = this.cachedModels[modelType];
-            this.modelType = modelType;
-            this.isReady = true;
-            return Promise.resolve();
-        }
+        this.modelLoading = null;
+        this.isModelLoaded = false;
         
-        this.modelType = modelType;
-        this.isReady = false;
-        this.showModelStatus('Loading embeddings model, please wait...');
-        
-        this.readyPromise = new Promise(async (resolve, reject) => {
-            try {
-                console.log(`Loading model: ${modelType}`);
-                
-                if (modelType === 'universal-sentence-encoder') {
-                    // First try to load from the TF models directly (more reliable)
+        // Add fallback if memory manager isn't loaded yet
+        if (typeof TensorflowMemoryManager === 'undefined' || typeof memoryManager === 'undefined') {
+            console.warn('Memory manager not found, creating fallback instance');
+            this.memoryManager = {
+                runWithMemoryManagement: async (operation) => {
+                    // Simple fallback implementation
                     try {
-                        this.model = await use.load();
-                        console.log('Loaded model using @tensorflow-models/universal-sentence-encoder');
-                    } catch (err) {
-                        console.warn('Failed to load from TF models, trying TF Hub:', err);
-                        // Fallback to TF Hub if needed
-                        this.model = await tf.loadGraphModel(
-                            'https://tfhub.dev/tensorflow/tfjs-model/universal-sentence-encoder/1/model.json',
-                            { fromTFHub: true }
-                        );
-                    }
-                } else {
-                    throw new Error(`Unknown model type: ${modelType}`);
-                }
-                
-                // Cache the model for future use
-                this.cachedModels[modelType] = this.model;
-                this.isReady = true;
-                console.log('Model loaded successfully');
-                this.hideModelStatus();
-                resolve();
-            } catch (error) {
-                console.error('Error loading model:', error);
-                this.showModelStatus(`Error loading model: ${error.message}. Retrying...`);
-                
-                // Try one more time with a delay
-                setTimeout(async () => {
-                    try {
-                        if (modelType === 'universal-sentence-encoder') {
-                            // Last resort - try loading a different version
-                            this.model = await tf.loadGraphModel(
-                                'https://storage.googleapis.com/tfjs-models/savedmodel/universal_sentence_encoder/model.json'
-                            );
-                            
-                            // Cache the model
-                            this.cachedModels[modelType] = this.model;
-                            this.isReady = true;
-                            console.log('Model loaded successfully on retry');
-                            this.hideModelStatus();
-                            resolve();
-                        } else {
-                            reject(error);
+                        return await operation();
+                    } finally {
+                        // Try basic cleanup
+                        if (typeof tf !== 'undefined' && tf.engine) {
+                            try {
+                                tf.engine().endScope();
+                            } catch (e) {
+                                console.warn('Fallback cleanup error:', e);
+                            }
                         }
-                    } catch (retryError) {
-                        console.error('Error loading model on retry:', retryError);
-                        this.showModelStatus(`Failed to load model: ${retryError.message}`);
-                        reject(retryError);
                     }
-                }, 2000);
-            }
-        });
-        
-        return this.readyPromise;
-    }
-    
-    async waitForReady() {
-        if (this.isReady) return Promise.resolve();
-        if (!this.readyPromise) {
-            this.readyPromise = this.loadModel();
-        }
-        return this.readyPromise;
-    }
-    
-    async vectorize(text) {
-        await this.waitForReady();
-        
-        if (this.modelType === 'universal-sentence-encoder') {
-            // Handle differently based on model source
-            if (this.model.embed) {
-                // This is the @tensorflow-models/universal-sentence-encoder model
-                const embeddings = await this.model.embed([text]);
-                const result = await embeddings.array();
-                embeddings.dispose(); // Properly dispose tensors
-                return result[0]; // Return the first (and only) embedding
-            } else {
-                // This is the TF Hub model
-                return tf.tidy(() => {
-                    const embeddings = this.model.predict(tf.tensor([text]));
-                    return Array.from(embeddings.dataSync());
-                });
-            }
+                }
+            };
         } else {
-            throw new Error(`Vectorization not implemented for model type: ${this.modelType}`);
+            this.memoryManager = memoryManager;
         }
     }
-    
+
+    /**
+     * Load the Universal Sentence Encoder model
+     * @returns {Promise<void>}
+     */
+    async loadModel() {
+        // Return existing model if already loaded
+        if (this.isModelLoaded && this.model) {
+            return;
+        }
+
+        // Return existing promise if already loading
+        if (this.modelLoading) {
+            return this.modelLoading;
+        }
+
+        // Show loading status in UI
+        this.showModelLoadingStatus(true, 'Loading text embedding model...');
+
+        try {
+            // Start loading with a timeout for error handling
+            const loadPromise = new Promise(async (resolve, reject) => {
+                try {
+                    // Set a timeout to catch hanging model loads
+                    const timeout = setTimeout(() => {
+                        reject(new Error('Model loading timed out after 30 seconds'));
+                    }, 30000);
+
+                    // Load the model
+                    console.log('Loading Universal Sentence Encoder model...');
+                    const model = await use.load();
+                    clearTimeout(timeout);
+                    
+                    console.log('Model loaded successfully');
+                    resolve(model);
+                } catch (error) {
+                    reject(error);
+                }
+            });
+
+            this.modelLoading = loadPromise;
+            this.model = await loadPromise;
+            this.isModelLoaded = true;
+            
+            // Update UI when model is loaded
+            this.showModelLoadingStatus(false, 'Text embedding model loaded!');
+            
+            // Cleanup
+            this.modelLoading = null;
+            return this.model;
+        } catch (error) {
+            console.error('Error loading text embedding model:', error);
+            this.showModelLoadingStatus(true, 'Error loading model. Retrying...');
+            this.modelLoading = null;
+            throw error;
+        }
+    }
+
+    /**
+     * Show or hide model loading status in the UI
+     * @param {boolean} isLoading - Whether the model is loading
+     * @param {string} message - Status message to display
+     */
+    showModelLoadingStatus(isLoading, message = '') {
+        const modelStatusEl = document.getElementById('modelStatus');
+        const modelStatusMessageEl = document.getElementById('modelStatusMessage');
+        
+        if (!modelStatusEl || !modelStatusMessageEl) return;
+        
+        if (isLoading) {
+            modelStatusMessageEl.textContent = message;
+            const toast = new bootstrap.Toast(modelStatusEl);
+            toast.show();
+        } else {
+            // Hide after a short delay to show completion message
+            modelStatusMessageEl.textContent = message;
+            setTimeout(() => {
+                const toast = bootstrap.Toast.getInstance(modelStatusEl);
+                if (toast) toast.hide();
+            }, 1500);
+        }
+    }
+
+    /**
+     * Vectorize a single text string
+     * @param {string} text - Text to vectorize
+     * @returns {Promise<Float32Array>} Embedding vector
+     */
+    async vectorize(text) {
+        if (!text) return new Float32Array(512).fill(0);
+        
+        // Ensure model is loaded
+        await this.loadModel();
+        
+        try {
+            // Use memory management to prevent leaks
+            return await this.memoryManager.runWithMemoryManagement(async () => {
+                const embeddings = await this.model.embed([text]);
+                // Get data from tensor and dispose immediately
+                const data = await embeddings.array();
+                tf.dispose(embeddings);
+                
+                // Return the first (and only) embedding
+                return data[0];
+            });
+        } catch (error) {
+            console.error('Error generating embedding:', error);
+            // Return zero vector as fallback
+            return new Float32Array(512).fill(0);
+        }
+    }
+
+    /**
+     * Vectorize a batch of texts with progress reporting
+     * @param {string[]} texts - Array of text strings to vectorize
+     * @param {Function} [progressCallback] - Optional callback for progress updates
+     * @returns {Promise<Float32Array[]>} Array of embedding vectors
+     */
     async vectorizeBatch(texts, progressCallback = null) {
-        await this.waitForReady();
+        if (!texts || texts.length === 0) return [];
+        
+        // Ensure model is loaded
+        await this.loadModel();
+        
+        // Determine batch size based on text length
+        const avgTextLength = texts.reduce((sum, text) => sum + (text?.length || 0), 0) / texts.length;
+        // Adjust batch size dynamically - smaller batches for longer texts
+        const batchSize = avgTextLength > 5000 ? 8 : avgTextLength > 1000 ? 16 : 32;
         
         const results = [];
-        const batchSize = 16; // Process 16 items at a time
+        const totalBatches = Math.ceil(texts.length / batchSize);
         
-        for (let i = 0; i < texts.length; i += batchSize) {
-            const batch = texts.slice(i, i + batchSize);
-            
-            // Process batch
-            let batchResults;
-            
-            if (this.modelType === 'universal-sentence-encoder') {
-                if (this.model.embed) {
-                    // @tensorflow-models/universal-sentence-encoder model
-                    const embeddings = await this.model.embed(batch);
-                    batchResults = await embeddings.array();
-                    embeddings.dispose(); // Properly dispose tensors
-                } else {
-                    // TF Hub model
-                    batchResults = await tf.tidy(() => {
-                        const embeddings = this.model.predict(tf.tensor(batch));
-                        // Convert to regular arrays
-                        return Array.from(embeddings.dataSync())
-                            .reduce((arr, val, i) => {
-                                const index = Math.floor(i / embeddings.shape[1]);
-                                if (!arr[index]) arr[index] = [];
-                                arr[index].push(val);
-                                return arr;
-                            }, []);
-                    });
-                }
-            } else {
-                throw new Error(`Batch vectorization not implemented for model type: ${this.modelType}`);
-            }
-            
-            results.push(...batchResults);
-            
-            // Report progress
+        for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
+            // Report progress if callback provided
             if (progressCallback) {
-                const progress = (i + batchSize) / texts.length;
-                progressCallback(Math.min(progress, 1));
+                const progress = batchIndex / totalBatches;
+                progressCallback(progress);
             }
             
-            // Run garbage collection if available
-            if (window.gc) window.gc();
+            const startIdx = batchIndex * batchSize;
+            const endIdx = Math.min(startIdx + batchSize, texts.length);
+            const batchTexts = texts.slice(startIdx, endIdx);
             
-            // Small delay to avoid UI freezes
-            await new Promise(resolve => setTimeout(resolve, 10));
+            try {
+                // Process batch with memory management
+                const batchResults = await this.memoryManager.runWithMemoryManagement(async () => {
+                    const embeddings = await this.model.embed(batchTexts);
+                    const data = await embeddings.array();
+                    tf.dispose(embeddings);
+                    return data;
+                });
+                
+                results.push(...batchResults);
+                
+                // Introduce small delay to keep UI responsive for large batches
+                if (totalBatches > 5 && batchIndex < totalBatches - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 10));
+                }
+            } catch (error) {
+                console.error(`Error in batch ${batchIndex}:`, error);
+                // Add zero vectors for the failed batch
+                for (let i = 0; i < batchTexts.length; i++) {
+                    results.push(new Float32Array(512).fill(0));
+                }
+            }
+        }
+        
+        // Final progress update
+        if (progressCallback) {
+            progressCallback(1.0);
         }
         
         return results;
     }
-    
+
     /**
      * Calculate cosine similarity between two vectors
-     * @param {Array<number>} vec1 - First vector
-     * @param {Array<number>} vec2 - Second vector
-     * @returns {number} Cosine similarity (0-1)
+     * @param {Float32Array|number[]} vec1 - First vector
+     * @param {Float32Array|number[]} vec2 - Second vector
+     * @returns {number} Similarity score (0-1)
      */
     cosineSimilarity(vec1, vec2) {
+        if (!vec1 || !vec2 || vec1.length !== vec2.length) {
+            return 0;
+        }
+
         let dotProduct = 0;
-        let vec1Magnitude = 0;
-        let vec2Magnitude = 0;
-        
+        let mag1 = 0;
+        let mag2 = 0;
+
         for (let i = 0; i < vec1.length; i++) {
             dotProduct += vec1[i] * vec2[i];
-            vec1Magnitude += vec1[i] * vec1[i];
-            vec2Magnitude += vec2[i] * vec2[i];
+            mag1 += vec1[i] * vec1[i];
+            mag2 += vec2[i] * vec2[i];
         }
+
+        mag1 = Math.sqrt(mag1);
+        mag2 = Math.sqrt(mag2);
+
+        if (mag1 === 0 || mag2 === 0) return 0;
         
-        vec1Magnitude = Math.sqrt(vec1Magnitude);
-        vec2Magnitude = Math.sqrt(vec2Magnitude);
-        
-        return dotProduct / (vec1Magnitude * vec2Magnitude);
+        return dotProduct / (mag1 * mag2);
+    }
+
+    /**
+     * Find most similar vectors to a query vector
+     * @param {Float32Array|number[]} queryVec - Query vector
+     * @param {Array<{embedding: Float32Array|number[], ...}>} items - Array of items with embeddings
+     * @param {number} topK - Number of results to return
+     * @returns {Array<{...Object, similarity: number}>} Top K similar items with similarity scores
+     */
+    findMostSimilar(queryVec, items, topK = 5) {
+        if (!queryVec || !items || items.length === 0) {
+            return [];
+        }
+
+        // Calculate similarities
+        const withSimilarities = items.map(item => ({
+            ...item,
+            similarity: this.cosineSimilarity(queryVec, item.embedding)
+        }));
+
+        // Sort by similarity (descending)
+        withSimilarities.sort((a, b) => b.similarity - a.similarity);
+
+        // Return top K results
+        return withSimilarities.slice(0, topK);
+    }
+
+    /**
+     * Clean up resources
+     */
+    dispose() {
+        if (this.model && typeof this.model.dispose === 'function') {
+            this.model.dispose();
+        }
+        this.model = null;
+        this.isModelLoaded = false;
     }
 }
 
-const vectorizer = new Vectorizer();
+// Initialize global instance - wrap in try/catch for safety
+try {
+    const vectorizer = new Vectorizer();
+    // Make globally available
+    window.vectorizer = vectorizer;
+} catch (error) {
+    console.error('Error initializing vectorizer:', error);
+    // Create minimal fallback implementation
+    window.vectorizer = {
+        async loadModel() { 
+            console.warn('Using fallback vectorizer (non-functional)'); 
+            return null; 
+        },
+        async vectorize() { return new Float32Array(512).fill(0); },
+        async vectorizeBatch(texts) { 
+            return Array(texts.length).fill().map(() => new Float32Array(512).fill(0)); 
+        },
+        cosineSimilarity() { return 0; },
+        findMostSimilar() { return []; }
+    };
+}

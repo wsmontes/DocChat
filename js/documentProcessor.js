@@ -81,14 +81,86 @@ class DocumentProcessor {
             let offset = 0;
             let textContent = '';
             
+            // Initialize progress at 10%
             if (progressCallback) progressCallback(0.1, 'Reading large file in chunks...');
+            
+            // Create a more detailed status element for better user feedback
+            const createProcessingStatus = () => {
+                // Check if the status element already exists
+                let statusElement = document.getElementById('large-file-status');
+                if (statusElement) return statusElement;
+                
+                statusElement = document.createElement('div');
+                statusElement.id = 'large-file-status';
+                statusElement.style.position = 'fixed';
+                statusElement.style.bottom = '20px';
+                statusElement.style.left = '20px';
+                statusElement.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+                statusElement.style.color = 'white';
+                statusElement.style.padding = '12px 20px';
+                statusElement.style.borderRadius = '8px';
+                statusElement.style.zIndex = '9999';
+                statusElement.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.15)';
+                statusElement.style.maxWidth = '350px';
+                statusElement.style.fontSize = '14px';
+                statusElement.style.transition = 'opacity 0.3s ease';
+                
+                statusElement.innerHTML = `
+                    <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                        <div style="width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); 
+                                  border-top-color: white; border-radius: 50%; margin-right: 12px;
+                                  animation: status-spin 1s linear infinite;"></div>
+                        <div style="font-weight: 500;">Processing Large File</div>
+                    </div>
+                    <div id="large-file-progress-text" style="margin-bottom: 8px;">Reading file: 0%</div>
+                    <div style="background: rgba(255,255,255,0.2); height: 6px; border-radius: 3px; overflow: hidden;">
+                        <div id="large-file-progress-bar" style="background: #0d6efd; height: 100%; width: 0%;
+                              transition: width 0.3s ease;"></div>
+                    </div>
+                    <style>
+                        @keyframes status-spin { to { transform: rotate(360deg); } }
+                    </style>
+                `;
+                
+                document.body.appendChild(statusElement);
+                return statusElement;
+            };
+            
+            // Update status with more detailed information
+            const updateStatus = (progress, message) => {
+                const status = createProcessingStatus();
+                const progressBar = status.querySelector('#large-file-progress-bar');
+                const progressText = status.querySelector('#large-file-progress-text');
+                
+                if (progressBar) progressBar.style.width = `${progress * 100}%`;
+                if (progressText) progressText.textContent = message;
+                
+                // Report progress to the callback as well
+                if (progressCallback) progressCallback(progress, message);
+            };
             
             // Store the last time we yielded to the UI thread
             let lastYieldTime = Date.now();
+            let nextUpdateTime = Date.now() + 100; // First update after 100ms
             
             const readNextChunk = () => {
-                // Yield to UI thread every 200ms to prevent freezing
+                // Check if we need to update the status
                 const currentTime = Date.now();
+                if (currentTime >= nextUpdateTime) {
+                    const progress = offset / fileSize;
+                    const percent = Math.round(progress * 100);
+                    const processedMB = (offset / (1024 * 1024)).toFixed(1);
+                    const totalMB = (fileSize / (1024 * 1024)).toFixed(1);
+                    
+                    updateStatus(
+                        0.1 + (progress * 0.6), // Map file reading to 10%-70%
+                        `Reading file: ${percent}% (${processedMB}MB / ${totalMB}MB)`
+                    );
+                    
+                    nextUpdateTime = currentTime + 200; // Update every 200ms
+                }
+                
+                // Yield to UI thread every 200ms to prevent freezing
                 if (currentTime - lastYieldTime > 200) {
                     lastYieldTime = currentTime;
                     // Use setTimeout with 0 delay to yield to UI thread
@@ -101,40 +173,46 @@ class DocumentProcessor {
             };
             
             const readChunk = () => {
+                if (offset >= fileSize) {
+                    // We've read the entire file
+                    updateStatus(0.7, 'File read complete, processing content...');
+                    
+                    // Remove the status element after processing
+                    setTimeout(() => {
+                        const statusElement = document.getElementById('large-file-status');
+                        if (statusElement) {
+                            // Fade out then remove
+                            statusElement.style.opacity = '0';
+                            setTimeout(() => statusElement.remove(), 300);
+                        }
+                    }, 1000);
+                    
+                    resolve(textContent);
+                    return;
+                }
+                
+                const slice = file.slice(offset, offset + chunkSize);
                 const reader = new FileReader();
                 
                 reader.onload = (e) => {
                     textContent += e.target.result;
                     offset += chunkSize;
-                    
-                    // Report progress
-                    const progress = Math.min(0.1 + (offset / fileSize) * 0.3, 0.4);
-                    if (progressCallback) progressCallback(progress, `Reading file: ${Math.min(100, Math.round(offset / fileSize * 100))}%`);
-                    
-                    if (offset < fileSize) {
-                        // Read the next chunk
-                        readNextChunk();
-                    } else {
-                        // Done reading the file
-                        if (progressCallback) progressCallback(0.4, 'File loaded completely.');
-                        
-                        // Clean up memory before resolving
-                        setTimeout(() => {
-                            resolve(textContent);
-                        }, 10);
-                    }
+                    readNextChunk();
                 };
                 
-                reader.onerror = (error) => {
-                    reject(new Error('Error reading file: ' + error));
+                reader.onerror = (e) => {
+                    console.error('Error reading file:', e);
+                    reject(new Error('Error reading file: ' + e.target.error.message));
+                    
+                    // Remove status element on error
+                    const statusElement = document.getElementById('large-file-status');
+                    if (statusElement) statusElement.remove();
                 };
                 
-                // Read a chunk
-                const blob = file.slice(offset, offset + chunkSize);
-                reader.readAsText(blob);
+                reader.readAsText(slice);
             };
             
-            // Start reading chunks
+            // Start reading
             readNextChunk();
         });
     }

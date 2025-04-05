@@ -1,168 +1,31 @@
 /**
- * Memory management utility for TensorFlow.js
- * Helps prevent memory leaks and monitor memory usage
+ * Memory manager for TensorFlow.js operations
+ * Prevents memory leaks and optimizes resource usage
  */
 class TensorflowMemoryManager {
     constructor() {
-        this.isSupported = typeof tf !== 'undefined' && tf.memory;
-        this.memoryLimit = 500000000; // 500MB memory limit before suggesting cleanup
-        this.memoryWarningDisplayed = false;
-        this.hasScopeTracking = this.checkScopeTrackingSupport();
+        // Check if TensorFlow is available
+        this.isSupported = typeof tf !== 'undefined';
         
-        if (this.isSupported && !this.hasScopeTracking) {
-            console.log('TensorFlow.js is available but scope tracking is not supported. Using alternative memory management.');
-        }
-    }
-    
-    /**
-     * Check if TensorFlow.js scope tracking is available
-     * @returns {boolean} Whether scope tracking is supported
-     */
-    checkScopeTrackingSupport() {
-        if (!this.isSupported) return false;
-        
-        try {
-            const engine = tf.engine();
-            // Check both for the engine and the specific functions we need
-            return engine && 
-                   typeof engine.startScope === 'function' && 
-                   typeof engine.endScope === 'function' && 
-                   engine.state && 
-                   typeof engine.state.track === 'function';
-        } catch (error) {
-            console.warn('Error checking TensorFlow.js scope support:', error);
-            return false;
-        }
-    }
-    
-    /**
-     * Check current memory usage and display warnings if needed
-     */
-    checkMemoryUsage() {
-        if (!this.isSupported) return;
-        
-        try {
-            const memoryInfo = tf.memory();
-            console.log('TensorFlow.js memory usage:', memoryInfo);
+        // Feature detection for different memory management approaches
+        if (this.isSupported) {
+            this.hasScopeTracking = typeof tf.engine === 'function' && 
+                                    typeof tf.engine().startScope === 'function';
             
-            // Check if memory usage is high
-            if (memoryInfo.numBytes > this.memoryLimit && !this.memoryWarningDisplayed) {
-                console.warn('TensorFlow.js memory usage is high. Consider disposing unused tensors.');
-                this.memoryWarningDisplayed = true;
-                
-                // Reset warning flag after some time
-                setTimeout(() => {
-                    this.memoryWarningDisplayed = false;
-                }, 60000); // Reset after 1 minute
-            }
-        } catch (error) {
-            console.error('Error checking memory usage:', error);
-        }
-    }
-    
-    /**
-     * Clean up unused tensors using the appropriate method
-     */
-    cleanupMemory() {
-        if (!this.isSupported) return;
-        
-        try {
-            console.log('Cleaning up TensorFlow.js memory...');
-            
-            // Safely check if tf is accessible
-            if (!tf || !tf.engine) {
-                console.warn('TensorFlow.js not properly initialized, skipping memory cleanup');
-                return;
-            }
-            
-            // Use scope-based cleanup if available
-            if (this.hasScopeTracking) {
-                this.cleanupUsingScopes();
-            } else {
-                // Alternative memory management when scope tracking is not available
-                this.alternativeCleanup();
-            }
-            
-            // Force garbage collection if available
-            if (window.gc) window.gc();
-            
-            this.checkMemoryUsage();
-        } catch (error) {
-            console.error('Error during memory cleanup:', error);
-        }
-    }
-    
-    /**
-     * Cleanup memory using TensorFlow.js scopes when available
-     * @private
-     */
-    cleanupUsingScopes() {
-        try {
-            // Safely dispose variables
-            if (typeof tf.disposeVariables === 'function') {
-                tf.disposeVariables();
-            }
-            
-            const engine = tf.engine();
-            if (engine) {
-                // End current scope to clean up temporary tensors
-                engine.endScope();
-                // Start a new scope for future operations
-                engine.startScope();
-            }
-        } catch (error) {
-            console.warn('Error during scope-based cleanup:', error);
-            // Fall back to alternative cleanup if scope-based cleanup fails
-            this.alternativeCleanup();
-        }
-    }
-    
-    /**
-     * Alternative memory cleanup when scope tracking is not available
-     * @private
-     */
-    alternativeCleanup() {
-        // Method 1: Try to dispose variables
-        try {
-            if (typeof tf.disposeVariables === 'function') {
-                tf.disposeVariables();
-            }
-        } catch (error) {
-            console.warn('Error disposing variables:', error);
+            // Log memory management approach
+            console.log(`TensorFlow memory management initialized. Using ${
+                this.hasScopeTracking ? 'scope tracking' : 
+                (typeof tf.tidy === 'function' ? 'tf.tidy' : 'fallback cleanup')
+            }`);
+        } else {
+            console.warn('TensorFlow.js not available - running without memory management');
         }
         
-        // Method 2: Try to clean up using keepTensors
-        try {
-            if (typeof tf.tidy === 'function') {
-                // Use tidy to automatically clean up intermediate tensors
-                tf.tidy(() => {
-                    // Nothing to do here - tidy will clean up tensors created inside
-                });
-            }
-        } catch (error) {
-            console.warn('Error using tf.tidy:', error);
-        }
-        
-        // Method 3: If all else fails, try to dispose specific tensors
-        try {
-            // Get all tensors and dispose non-persistent ones
-            if (typeof tf.memory === 'function') {
-                const tensors = tf.memory().numTensors;
-                if (tensors > 100) { // Only do this cleanup if we have many tensors
-                    console.log(`Found ${tensors} tensors, attempting disposal of unused ones`);
-                    tf.dispose();
-                }
-            }
-        } catch (error) {
-            console.warn('Error disposing tensors:', error);
-        }
+        // Track tensors to help with debugging
+        this.lastMemorySnapshot = null;
+        this.memoryLeakThreshold = 20; // Alert if tensor count increases by this amount
     }
     
-    /**
-     * Run an operation in a managed memory context
-     * @param {Function} operation - The operation to run
-     * @returns {Promise} The result of the operation
-     */
     async runWithMemoryManagement(operation) {
         if (!this.isSupported) return operation();
         
@@ -200,16 +63,93 @@ class TensorflowMemoryManager {
             }
         }
     }
+    
+    /**
+     * Alternative cleanup when tf.tidy and scope tracking are unavailable
+     */
+    alternativeCleanup() {
+        if (!this.isSupported) return;
+        
+        try {
+            // Get all tensors in memory
+            const tensors = tf.memory().numTensors;
+            if (tensors > 50) { // Only perform cleanup if many tensors exist
+                console.warn(`High tensor count (${tensors}) detected, performing emergency cleanup`);
+                tf.disposeVariables();
+                
+                // Try more aggressive cleanup if available
+                if (typeof gc === 'function') {
+                    gc();
+                }
+            }
+        } catch (error) {
+            console.error('Error during alternative cleanup:', error);
+        }
+    }
+    
+    /**
+     * Check memory usage and detect potential leaks
+     */
+    checkMemoryUsage() {
+        if (!this.isSupported) return;
+        
+        try {
+            const memInfo = tf.memory();
+            const currentStats = {
+                tensors: memInfo.numTensors,
+                bytes: memInfo.numBytes,
+                timestamp: Date.now()
+            };
+            
+            // Compare with previous snapshot if available
+            if (this.lastMemorySnapshot) {
+                const tensorDiff = currentStats.tensors - this.lastMemorySnapshot.tensors;
+                const timeDiff = (currentStats.timestamp - this.lastMemorySnapshot.timestamp) / 1000;
+                
+                // Alert if tensor count has increased significantly
+                if (tensorDiff > this.memoryLeakThreshold) {
+                    console.warn(`Possible memory leak: +${tensorDiff} tensors in ${timeDiff.toFixed(1)}s`);
+                    // Try to force garbage collection
+                    this.cleanupMemory();
+                }
+            }
+            
+            // Update snapshot
+            this.lastMemorySnapshot = currentStats;
+            
+        } catch (error) {
+            console.error('Error checking memory usage:', error);
+        }
+    }
+    
+    /**
+     * Try to clean up memory when leaks are detected
+     */
+    cleanupMemory() {
+        if (!this.isSupported) return;
+        
+        try {
+            console.log('Performing TensorFlow memory cleanup');
+            
+            // Approach 1: Dispose variables
+            if (typeof tf.disposeVariables === 'function') {
+                tf.disposeVariables();
+            }
+            
+            // Approach 2: Manually collect garbage if available in the browser
+            if (typeof window !== 'undefined' && typeof window.gc === 'function') {
+                window.gc();
+            }
+            
+            // Log final tensor count
+            const memInfo = tf.memory();
+            console.log(`After cleanup: ${memInfo.numTensors} tensors, ${(memInfo.numBytes / 1048576).toFixed(2)} MB`);
+            
+        } catch (error) {
+            console.error('Error cleaning up memory:', error);
+        }
+    }
 }
 
-// Create a global instance for use throughout the app
+// Create a global instance
 const memoryManager = new TensorflowMemoryManager();
-
-// Set up periodic memory checks
-setInterval(() => {
-    try {
-        memoryManager.checkMemoryUsage();
-    } catch (error) {
-        console.error('Error in periodic memory check:', error);
-    }
-}, 30000); // Check every 30 seconds

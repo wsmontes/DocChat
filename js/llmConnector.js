@@ -217,95 +217,147 @@ class LlmConnector {
      * @returns {Promise<Array<{summary: string, chunks: Array<Object>}>>} Summaries with their source chunks
      */
     async generateChunkGroupSummaries(chunkGroups, question, conversationHistory = []) {
-        if (!this.isConfigured) {
-            throw new Error('API key not configured');
-        }
+        // Organize inputs into processing batches
+        const concurrencyLimit = 3; // Limit parallel requests to prevent rate limiting
+        const results = [];
         
-        const summaries = [];
+        // Create a progress indicator
+        const progressElement = this.createProgressIndicator('Analyzing document sections...');
         
-        // Process each chunk group in parallel with rate limiting
-        const concurrencyLimit = 3; // Maximum concurrent requests
-        const batchResults = [];
-        
-        // Create batches to process
-        for (let i = 0; i < chunkGroups.length; i += concurrencyLimit) {
-            const batch = chunkGroups.slice(i, i + concurrencyLimit);
-            const batchPromises = batch.map(async (group, index) => {
-                try {
-                    // Format the chunks into a readable context
-                    const context = group.map((chunk, idx) => {
-                        const docInfo = chunk.documentTitle ? ` (from "${chunk.documentTitle}")` : '';
-                        return `[${idx + 1}]${docInfo} ${chunk.text}`;
-                    }).join('\n\n');
-                    
-                    // Create system prompt with context from conversation history
-                    let conversationContext = '';
-                    if (conversationHistory && conversationHistory.length > 0) {
-                        // Extract last few exchanges for context
-                        const recentHistory = conversationHistory.slice(-4);
-                        conversationContext = recentHistory.map(msg => 
-                            `${msg.role === 'user' ? 'User asked' : 'You answered'}: ${msg.content.substring(0, 200)}...`
-                        ).join('\n');
+        try {
+            for (let i = 0; i < chunkGroups.length; i += concurrencyLimit) {
+                const batch = chunkGroups.slice(i, i + concurrencyLimit);
+                
+                // Update progress
+                const progress = Math.min(100, Math.round((i / chunkGroups.length) * 100));
+                this.updateProgressIndicator(progressElement, `Analyzing document sections: ${progress}%`);
+                
+                const batchPromises = batch.map(async (group, index) => {
+                    try {
+                        // Extract recent conversation for context
+                        const conversationContext = this.extractConversationContext(conversationHistory);
+                        
+                        // Format context from the chunks in this group
+                        const context = this.formatChunksAsContext(group.chunks);
+                        
+                        const messages = [
+                            {
+                                role: 'system',
+                                content: `You are an AI that creates concise summaries of document excerpts. 
+                                Summarize the key information in the provided excerpts that would be most relevant to answering the user's question.
+                                Focus only on the most relevant facts and details.
+                                Keep your summary under 150 words.`
+                            },
+                            {
+                                role: 'user',
+                                content: `
+                                I need a concise summary of these document excerpts that focuses on information relevant to the following question: "${question}"
+                                
+                                ${conversationContext ? `\nRecent conversation context:\n${conversationContext}\n` : ''}
+                                
+                                Document excerpts:
+                                ${context}
+                                
+                                Create a concise summary of the most relevant information from these excerpts that would help answer the question.
+                                `
+                            }
+                        ];
+                        
+                        // Implement the rest of the summary generation logic
+                        const result = await this.sendRequest(messages);
+                        return {
+                            group,
+                            summary: result
+                        };
+                    } catch (error) {
+                        console.error('Error generating summary for chunk group:', error);
+                        return {
+                            group,
+                            summary: `Error generating summary: ${error.message}`,
+                            error: true
+                        };
                     }
-                    
-                    // Create messages for the API
-                    const messages = [
-                        {
-                            role: 'system',
-                            content: `You are an AI that creates concise summaries of document excerpts. 
-                            Summarize the key information in the provided excerpts that would be most relevant to answering the user's question.
-                            Focus only on the most relevant facts and details.
-                            Keep your summary under 150 words.`
-                        },
-                        {
-                            role: 'user',
-                            content: `
-                            I need a concise summary of these document excerpts that focuses on information relevant to the following question: "${question}"
-                            
-                            ${conversationContext ? `\nRecent conversation context:\n${conversationContext}\n` : ''}
-                            
-                            Document excerpts:
-                            ${context}
-                            
-                            Create a concise summary of the most relevant information from these excerpts that would help answer the question.
-                            `
-                        }
-                    ];
-                    
-                    // Make API request with a timeout to prevent stalling
-                    const summary = await this.sendRequest(messages);
-                    
-                    return {
-                        summary,
-                        chunks: group,
-                        originalIndex: i + index
-                    };
-                } catch (error) {
-                    console.error(`Error generating summary for chunk group ${i + index}:`, error);
-                    // Return a fallback summary to ensure we don't lose the chunks
-                    return {
-                        summary: "Error generating summary.",
-                        chunks: group,
-                        originalIndex: i + index,
-                        error: true
-                    };
+                });
+                
+                // Wait for all requests in this batch to complete before starting the next batch
+                const batchResults = await Promise.all(batchPromises);
+                results.push(...batchResults);
+                
+                // Small delay between batches to prevent rate limiting
+                if (i + concurrencyLimit < chunkGroups.length) {
+                    await new Promise(resolve => setTimeout(resolve, 200));
                 }
-            });
-            
-            // Wait for the current batch to complete
-            const batchResults = await Promise.all(batchPromises);
-            summaries.push(...batchResults);
-            
-            // Small delay between batches to avoid rate limiting
-            if (i + concurrencyLimit < chunkGroups.length) {
-                await new Promise(resolve => setTimeout(resolve, 500));
             }
+        } finally {
+            // Remove progress indicator when done
+            this.removeProgressIndicator(progressElement);
         }
         
-        // Sort by original index to maintain order
-        summaries.sort((a, b) => a.originalIndex - b.originalIndex);
+        return results.filter(r => !r.error);
+    }
+    
+    // Helper to create a non-blocking progress indicator
+    createProgressIndicator(message) {
+        const element = document.createElement('div');
+        element.className = 'llm-progress-indicator';
+        element.style.position = 'fixed';
+        element.style.bottom = '20px';
+        element.style.right = '20px';
+        element.style.backgroundColor = 'rgba(13, 110, 253, 0.9)';
+        element.style.color = 'white';
+        element.style.padding = '10px 15px';
+        element.style.borderRadius = '8px';
+        element.style.boxShadow = '0 4px 12px rgba(0, 0, 0, 0.15)';
+        element.style.zIndex = '1050';
+        element.style.maxWidth = '300px';
+        element.style.fontSize = '14px';
+        element.style.transition = 'opacity 0.3s ease';
         
-        return summaries;
+        element.innerHTML = `
+            <div style="display: flex; align-items: center; gap: 10px;">
+                <div class="spinner" style="width: 16px; height: 16px; border: 2px solid rgba(255,255,255,0.3); 
+                          border-top-color: white; border-radius: 50%; animation: llm-spin 1s linear infinite;"></div>
+                <div class="message">${message}</div>
+            </div>
+            <style>
+                @keyframes llm-spin { to { transform: rotate(360deg); } }
+            </style>
+        `;
+        
+        document.body.appendChild(element);
+        return element;
+    }
+    
+    updateProgressIndicator(element, message) {
+        if (!element) return;
+        const messageEl = element.querySelector('.message');
+        if (messageEl) messageEl.textContent = message;
+    }
+    
+    removeProgressIndicator(element) {
+        if (!element) return;
+        element.style.opacity = '0';
+        setTimeout(() => {
+            if (element.parentNode) {
+                element.parentNode.removeChild(element);
+            }
+        }, 300);
+    }
+    
+    // Helper to extract conversation context for better continuity
+    extractConversationContext(history) {
+        if (!history || history.length === 0) return '';
+        
+        // Get last 3 turns of conversation for context
+        const recentHistory = history.slice(-Math.min(6, history.length));
+        return recentHistory.map(msg => `${msg.role}: ${msg.content}`).join('\n\n');
+    }
+    
+    // Format chunks as context in a more readable way
+    formatChunksAsContext(chunks) {
+        return chunks.map((chunk, index) => 
+            `[Excerpt ${index + 1}]:\n${chunk.text.trim()}\n`
+        ).join('\n');
     }
     
     /**
